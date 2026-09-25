@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+
+<header class="masthead">
+  <div class="mark" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.7"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3.2l1.9 4.9 4.9 1.9-4.9 1.9L12 16.8l-1.9-4.9L5.2 10l4.9-1.9z"/>
+      <path d="M18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>
+    </svg>
+  </div>
+  <h1>Assistant AI</h1>
+  <p class="tagline">
+    {{ accounts | length }} Google account{{ '' if accounts | length == 1 else 's' }} connected.
+  </p>
+</header>
+
+{% for account in accounts %}
+<div class="card">
+  <div class="card-head">
+    <h2>{{ account.email }}</h2>
+    {% if account.healthy %}
+      <span class="badge badge-ok">Active</span>
+    {% else %}
+      <span class="badge badge-bad">Needs reconnect</span>
+    {% endif %}
+  </div>
+  <div class="meta">Connected {{ account.connected_at }}</div>
+
+  {% if not account.healthy %}
+  <p class="lede">
+    Google no longer accepts the stored refresh token. If this OAuth app is still in
+    &ldquo;Testing&rdquo;, refresh tokens expire after 7 days &mdash; reconnect to get a new one.
+  </p>
+  {% endif %}
+
+  <div class="actions">
+    <form method="post" action="/disconnect/{{ account.email | urlencode }}">
+      <button class="btn btn-quiet" type="submit">Disconnect</button>
+    </form>
+    <a class="btn btn-quiet" href="/auth/google/start">
+      {{ 'Reconnect' if not account.healthy else 'Connect another account' }}
+    </a>
+  </div>
+
+  <details>
+    <summary>Granted scopes</summary>
+    <ul class="scopes">
+      {% for scope in account.scopes %}<li>{{ scope }}</li>{% endfor %}
+    </ul>
+  </details>
+</div>
+{% endfor %}
+
+{% endblock %}
+
+{% block footer %}
+<footer>Credentials are stored locally in <code>data/tokens.json</code>.</footer>
+{% endblock %}

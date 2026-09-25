@@ -1,0 +1,48 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Stored OAuth credentials
+data/
+
+# Google credential files downloaded from Cloud Console.
+# The app reads its client id/secret from .env, but the console hands you a
+# JSON file by default and it lands in the project root.
+client_secret*.json
+credentials.json
+token.json
+tokens.json
+*-service-account*.json
+*.p12
+*.pem
+
+# Editor and OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Logs
+*.log
