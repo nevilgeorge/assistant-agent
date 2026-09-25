@@ -85,6 +85,17 @@ def _verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_2026(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from assistant_agent.export_2026 import export_account
+
+    report = export_account(args.email, Path(args.output), calendar_only=args.calendar_only)
+    print(json.dumps(report, indent=2))
+    return 0 if report["complete"] else 1
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -97,6 +108,12 @@ def main() -> None:
     verify = subparsers.add_parser("verify", help="make a real Gmail and Calendar call")
     verify.add_argument("--email", help="account to verify (default: the first one)")
     verify.set_defaults(func=_verify)
+
+    export = subparsers.add_parser("export-2026", help="export 2026 Gmail and Calendar JSON")
+    export.add_argument("--email", help="connected account (required when multiple accounts exist)")
+    export.add_argument("--output", default="data", help="output directory (default: data)")
+    export.add_argument("--calendar-only", action="store_true", help="export Calendar without listing or fetching Gmail")
+    export.set_defaults(func=_export_2026)
 
     args = parser.parse_args()
     handler = getattr(args, "func", _serve)

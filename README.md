@@ -84,11 +84,30 @@ The app handles this gracefully either way: a dead refresh token shows a
 uv run assistant-agent serve      # run the web app (default)
 uv run assistant-agent accounts   # list connected accounts and their scopes
 uv run assistant-agent verify     # make a real Gmail + Calendar call
+uv run assistant-agent export-2026  # export the connected account's 2026 data
+uv run assistant-agent export-2026 --calendar-only  # export only 2026 Calendar events
 ```
 
 `verify` is the proof that the stored credentials actually work — it refreshes
 them if needed, prints your Gmail address and message count via
 `users.getProfile`, and lists your next three calendar events.
+
+`export-2026` saves full Gmail message JSON to `data/emails/2026/<id>.json`
+and Calendar event JSON to `data/calendar/2026/<calendar-hash>/<event-hash>.json`.
+Each event file contains its source `calendarId` alongside the event. The UTC
+window is January 1, 2026 (inclusive) through January 1, 2027 (exclusive).
+Calendar events that overlap the window, including expanded recurring instances,
+are included. Spam, Trash, cancelled events, and separately fetched attachment
+bytes are excluded. The command limits all API requests to four in flight and
+two starts per second. It retries transient errors, skips saved records on
+reruns, and writes `data/export-2026-report.json` with counts and incomplete
+work. A partial run exits with status 1; rerun the command to resume. Use
+`--email ADDRESS` if more than one account is connected, and `--output PATH` to
+choose a different output directory.
+
+Add `--calendar-only` to skip Gmail entirely, including its message listing.
+Calendar-only runs leave existing email files and the full-export report alone
+and write `data/export-2026-calendar-report.json` instead.
 
 ## Where credentials live
 
