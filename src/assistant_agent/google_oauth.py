@@ -26,7 +26,7 @@ def build_flow(state: str | None = None, code_verifier: str | None = None) -> Fl
     return flow
 
 
-def authorization_url() -> tuple[str, str, str]:
+def authorization_url(*, nonce: str | None = None) -> tuple[str, str, str | None]:
     """Return (url, state, code_verifier) for the consent screen.
 
     `access_type=offline` is what makes Google issue a refresh token at all;
@@ -45,6 +45,7 @@ def authorization_url() -> tuple[str, str, str]:
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
+        nonce=nonce,
     )
     return url, state, flow.code_verifier
 
@@ -57,7 +58,7 @@ def exchange_code(
     return flow.credentials
 
 
-def account_identity(creds: Credentials) -> tuple[str, str | None]:
+def account_identity(creds: Credentials, *, expected_nonce: str | None = None) -> tuple[str, str]:
     """Return (email, google_account_id) from the ID token in the token response.
 
     Cheaper and stronger than calling the userinfo endpoint: the ID token is
@@ -70,7 +71,11 @@ def account_identity(creds: Credentials) -> tuple[str, str | None]:
         get_settings().google_client_id,
         clock_skew_in_seconds=10,
     )
-    return claims["email"], claims.get("sub")
+    if expected_nonce is None or claims.get("nonce") != expected_nonce:
+        raise ValueError("ID token nonce mismatch")
+    if claims.get("email_verified") not in (True, "true") or not claims.get("sub"):
+        raise ValueError("Google account identity is not verified")
+    return claims["email"], claims["sub"]
 
 
 def revoke(creds: Credentials) -> bool:

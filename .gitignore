@@ -46,3 +46,8 @@ htmlcov/
 
 # Logs
 *.log
+# Deployment outputs and local secrets
+*.tfstate*
+.terraform/
+deploy/local-db-password.txt
+deploy/.env.production

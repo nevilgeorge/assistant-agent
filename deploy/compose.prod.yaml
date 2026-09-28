@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: assistant_agent
+      POSTGRES_USER: assistant_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes: [/srv/assistant-agent/postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U assistant_agent -d assistant_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  app:
+    image: ${IMAGE_URI}
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      BASE_URL: https://${DOMAIN}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      DATABASE_URL: postgresql+psycopg://assistant_agent:${POSTGRES_PASSWORD}@db:5432/assistant_agent
+    depends_on:
+      db: {condition: service_healthy}
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/assistant-agent/caddy-data:/data
+      - /srv/assistant-agent/caddy-config:/config
+    depends_on: [app]

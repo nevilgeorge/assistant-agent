@@ -8,13 +8,18 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.16,<2",
+    "cryptography>=45,<51",
     "fastapi>=0.141.1",
     "google-api-python-client>=2.200.0",
     "google-auth>=2.58.1",
     "google-auth-oauthlib>=1.4.1",
     "itsdangerous>=2.2.0",
     "jinja2>=3.1.6",
+    "psycopg[binary]>=3.2,<4",
     "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.20,<1",
+    "sqlalchemy>=2.0,<3",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -24,3 +29,9 @@ assistant-agent = "assistant_agent:main"
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27,<1",
+    "pytest>=8,<10",
+]

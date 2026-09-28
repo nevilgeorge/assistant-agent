@@ -35,11 +35,12 @@
   {% endif %}
 
   <div class="actions">
-    <form method="post" action="/disconnect/{{ account.email | urlencode }}">
+    <form method="post" action="/disconnect">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="btn btn-quiet" type="submit">Disconnect</button>
     </form>
     <a class="btn btn-quiet" href="/auth/google/start">
-      {{ 'Reconnect' if not account.healthy else 'Connect another account' }}
+      {{ 'Reconnect' if not account.healthy else 'Reconnect account' }}
     </a>
   </div>
 
@@ -55,5 +56,5 @@
 {% endblock %}
 
 {% block footer %}
-<footer>Credentials are stored locally in <code>data/tokens.json</code>.</footer>
+<footer>Gmail and Calendar access is read-only. Disconnect to remove your saved credentials.</footer>
 {% endblock %}

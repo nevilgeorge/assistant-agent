@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: assistant_agent
+      POSTGRES_USER: assistant_agent
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U assistant_agent -d assistant_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  app:
+    build: .
+    environment:
+      APP_ENV: development
+      BASE_URL: http://localhost:8000
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      DATABASE_URL: postgresql+psycopg://assistant_agent:${POSTGRES_PASSWORD}@db:5432/assistant_agent
+    depends_on:
+      db: {condition: service_healthy}
+    ports: ["127.0.0.1:8000:8000"]
+secrets:
+  db_password:
+    file: ./deploy/local-db-password.txt
+volumes:
+  pgdata:

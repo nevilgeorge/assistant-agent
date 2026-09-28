@@ -1,0 +1,7 @@
+.git
+.venv
+.env*
+data
+.pytest_cache
+*.pyc
+terraform
