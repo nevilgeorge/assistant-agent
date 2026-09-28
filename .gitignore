@@ -28,6 +28,13 @@ tokens.json
 *.p12
 *.pem
 
+# Derived output from the export index tooling. build_index.py writes
+# `events.jsonl` in the current directory and `.index/` beside itself, so running
+# one from the repo root or from src/assistant_agent/agent_kit/ would otherwise
+# leave private mail-derived output in a tracked path.
+.index/
+*.jsonl
+
 # Editor and OS cruft
 *.swp
 *.swo
