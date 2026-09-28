@@ -38,7 +38,11 @@ with open('/opt/assistant-agent/.env','w') as file:
 os.chmod('/opt/assistant-agent/.env',0o600)
 PY
 cd "$work"
-docker compose --env-file .env up -d db
+# PGDATA is a subdirectory, so PostgreSQL also needs access to its parent bind mount.
+# Resolve the postgres UID/GID inside the image rather than assuming host IDs.
+docker compose --env-file .env run --rm --no-deps --user root --entrypoint sh db \
+  -c 'chown postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data'
+docker compose --env-file .env up -d --wait --wait-timeout 180 db
 docker compose --env-file .env run --rm app alembic upgrade head
 docker compose --env-file .env up -d app caddy
 for attempt in $(seq 1 30); do
