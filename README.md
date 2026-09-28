@@ -34,6 +34,29 @@ docker compose up -d app
 
 The local Compose setup exposes only the app on `127.0.0.1:8000`. Local exports remain on disk under `data/` and do not enter the containers.
 
+### Agent kit
+
+Each export directory carries a `CLAUDE.md` explaining the format to an assistant
+agent, plus the stdlib-only `build_index.py` that turns the export into a queryable
+index. The source of truth for those files is `src/assistant_agent/agent_kit/`; the
+copies under `data/` are generated. Install them after an export has created the
+directories:
+
+```bash
+uv run assistant-agent export-2026
+uv run assistant-agent install-kit
+uv run assistant-agent install-kit --check   # report drift, write nothing
+```
+
+`install-kit` refuses to overwrite a copy that was edited in place and reports it
+instead; pass `--force` once the change has been moved back into
+`src/assistant_agent/agent_kit/`. Edit the packaged source, never the copy.
+
+Run `build_index.py` from the export directory it was installed into, not from
+`src/assistant_agent/agent_kit/` -- it writes its index beside itself, and `.index/`
+and `*.jsonl` are gitignored precisely so a stray run cannot leave mail-derived
+output in a tracked path.
+
 To inspect the database, open an interactive `psql` session inside the database container:
 
 ```bash

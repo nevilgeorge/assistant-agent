@@ -96,6 +96,43 @@ def _export_2026(args: argparse.Namespace) -> int:
     return 0 if report["complete"] else 1
 
 
+def _install_kit(args: argparse.Namespace) -> int:
+    """Copy the agent instructions and index tooling into an export directory."""
+    from pathlib import Path
+
+    from assistant_agent.agent_kit import check_agent_kit, install_agent_kit
+
+    data_dir = Path(args.output)
+
+    if args.check:
+        statuses = check_agent_kit(data_dir)
+        drifted = [s for s in statuses if s.state != "clean"]
+        for status in statuses:
+            print(f"{status.state:>10}  {status.relpath}")
+        if drifted:
+            print(f"\n{len(drifted)} file(s) need attention. Re-run without --check to install,")
+            print("or with --force to overwrite copies that were edited in place.")
+        return 1 if drifted else 0
+
+    if not data_dir.is_dir():
+        print(f"{data_dir} does not exist. Run `assistant-agent export-2026` first.")
+        return 1
+
+    report = install_agent_kit(data_dir, force=args.force)
+    for relpath in report["written"]:
+        print(f"   written  {relpath}")
+    for relpath in report["unchanged"]:
+        print(f" unchanged  {relpath}")
+    for entry in report["skipped"]:
+        print(f"   skipped  {entry['relpath']}  ({entry['state']})")
+    if report["skipped"]:
+        print("\nSkipped files differ from the packaged source. Re-run with --force to")
+        print("overwrite them, after copying anything worth keeping back into")
+        print("src/assistant_agent/agent_kit/.")
+        return 1
+    return 0
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -114,6 +151,14 @@ def main() -> None:
     export.add_argument("--output", default="data", help="output directory (default: data)")
     export.add_argument("--calendar-only", action="store_true", help="export Calendar without listing or fetching Gmail")
     export.set_defaults(func=_export_2026)
+
+    kit = subparsers.add_parser(
+        "install-kit", help="install agent instructions and index tooling into an export directory"
+    )
+    kit.add_argument("--output", default="data", help="export directory (default: data)")
+    kit.add_argument("--check", action="store_true", help="report drift without writing")
+    kit.add_argument("--force", action="store_true", help="overwrite locally modified copies")
+    kit.set_defaults(func=_install_kit)
 
     args = parser.parse_args()
     handler = getattr(args, "func", _serve)

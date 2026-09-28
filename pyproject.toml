@@ -34,4 +34,20 @@ build-backend = "uv_build"
 dev = [
     "httpx>=0.27,<1",
     "pytest>=8,<10",
+    "ruff>=0.14,<0.15",
 ]
+
+[tool.ruff]
+line-length = 100
+
+# Ruff's default rules (pyflakes + a pycodestyle subset), which the existing code
+# already satisfies, so `ruff check` is enforceable from day one. Widening to
+# ["I", "UP", "B"] is worth doing, but it flags ~20 pre-existing violations across
+# web.py, store.py and the tests and belongs in its own change.
+
+[tool.ruff.lint.per-file-ignores]
+# The agent kit payload is copied verbatim into export directories and must run
+# under whatever interpreter a sandbox provides, so it cannot use 3.11+ spellings
+# that the rest of the package is free to use.
+"src/assistant_agent/agent_kit/calendar/*" = ["UP017"]
+"src/assistant_agent/agent_kit/emails/*" = ["UP017"]

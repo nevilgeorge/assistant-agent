@@ -22,6 +22,8 @@ SCOPES = [
 ]
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+# The agent kit installed into export directories; see assistant_agent.agent_kit.
+AGENT_KIT_DIR = Path(__file__).resolve().parent / "agent_kit"
 DATA_DIR = Path.cwd() / "data"
 TOKENS_PATH = DATA_DIR / "tokens.json"
 

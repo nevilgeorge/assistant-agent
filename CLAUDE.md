@@ -9,6 +9,11 @@ This is an application that orchestrates personal assistant agents for users:
 ## General guidelines
 Use subagents liberally (parallelize work, side exploration that shouldn't pollute the main context, etc).
 
+Never edit `data/*/CLAUDE.md` or `data/*/build_index.py` directly. Those are generated
+copies; the tracked source is `src/assistant_agent/agent_kit/`. Edit it there and run
+`uv run assistant-agent install-kit --force`. `install-kit --check` reports copies that
+have drifted.
+
 ## Writing Python
 - Use type hints extensively
 - Use ruff for linting
