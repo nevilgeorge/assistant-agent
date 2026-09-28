@@ -4,6 +4,8 @@ This is an application that orchestrates personal assistant agents for users:
 2. The app retrieves mail and calendar events from the past 6 months and indexes them. 
 3. The app orchestrates worker agents in sandboxes that are given these files to perform operations.  
 
+**Important note**: Agents can be run in sub-folders that have their own CLAUDE.md files. This file is specific to developing this application; it does not contain guidelines on how to run personal assistant agents.
+
 ## General guidelines
 Use subagents liberally (parallelize work, side exploration that shouldn't pollute the main context, etc).
 
