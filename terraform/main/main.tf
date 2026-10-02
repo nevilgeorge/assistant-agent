@@ -173,6 +173,25 @@ resource "aws_ecr_lifecycle_policy" "app" {
   # Encode a highest-priority rule that expires the oldest images when more than 20 remain, regardless of tags.
   policy     = jsonencode({ rules = [{ rulePriority = 1, description = "Retain 20 images", selection = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }, action = { type = "expire" } }] })
 }
+# Create a private Elastic Container Registry repository for the agent sandbox image.
+resource "aws_ecr_repository" "sandbox" {
+  # Name the repository after the project, suffixed to distinguish it from the app image.
+  name = "${var.name}-sandbox"
+  # Enable image vulnerability scanning when an image is pushed to this repository.
+  image_scanning_configuration { scan_on_push = true }
+  # Encrypt stored container images with ECR’s AES-256 encryption.
+  encryption_configuration { encryption_type = "AES256" }
+  # Apply the shared Project tag to this resource.
+  tags = local.tags
+}
+# Create a retention policy to remove older sandbox images.
+resource "aws_ecr_lifecycle_policy" "sandbox" {
+  # Apply the retention policy to the sandbox ECR repository.
+  repository = aws_ecr_repository.sandbox.name
+  # Retain fewer images than the app repository: the sandbox image is roughly 1.9 GiB and
+  # changes only when the vendored Dockerfile or its pinned CLI versions move.
+  policy     = jsonencode({ rules = [{ rulePriority = 1, description = "Retain 10 images", selection = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 10 }, action = { type = "expire" } }] })
+}
 # Create the IAM role that grants AWS permissions to the EC2 instance.
 resource "aws_iam_role" "instance" {
   # Give the instance role or profile a project-specific name.
@@ -251,6 +270,11 @@ resource "aws_instance" "app" {
     encrypted   = true
     # Use gp3 general-purpose SSD storage for the boot volume.
     volume_type = "gp3"
+    # Allocate 30 GiB rather than inheriting the AMI snapshot's 8 GiB. This volume holds
+    # /var/lib/docker, and the sandbox image alone is roughly 1.9 GiB; 8 GiB also has to
+    # cover the app, PostgreSQL and Caddy images, the swap file, the sandbox's writable
+    # layer, and untagged images left behind by repeated deploys.
+    volume_size = 30
   }
   # Enable detailed EC2 monitoring with one-minute CloudWatch metrics.
   monitoring = true
@@ -329,5 +353,7 @@ output "instance_id" { value = aws_instance.app.id }
 output "elastic_ip" { value = aws_eip.app.public_ip }
 # Expose the ECR repository URL for tagging and pushing container images.
 output "ecr_repository_url" { value = aws_ecr_repository.app.repository_url }
+# Expose the sandbox ECR repository URL for tagging and pushing the agent sandbox image.
+output "sandbox_ecr_repository_url" { value = aws_ecr_repository.sandbox.repository_url }
 # Expose the persistent EBS volume ID for storage management.
 output "data_volume_id" { value = aws_ebs_volume.data.id }

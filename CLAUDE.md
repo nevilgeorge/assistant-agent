@@ -14,6 +14,13 @@ copies; the tracked source is `src/assistant_agent/agent_kit/`. Edit it there an
 `uv run assistant-agent install-kit --force`. `install-kit --check` reports copies that
 have drifted.
 
+`src/assistant_agent/sandbox_kit/` is different despite the similar name: it is a
+byte-identical vendored copy of the `agent-sandbox` build context, not an installed kit.
+Nothing copies it anywhere and `install-kit` ignores it — `deploy/deploy.sh` builds it from
+the working tree. Change it upstream in `agent-sandbox` and re-sync; see its `UPSTREAM.md`.
+Never put a provenance header on that `Dockerfile`: line 1 must stay
+`# syntax=docker/dockerfile:1` or BuildKit's frontend selection silently turns off.
+
 ## Writing Python
 - Use type hints extensively
 - Use ruff for linting

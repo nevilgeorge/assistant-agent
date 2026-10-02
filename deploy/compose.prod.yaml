@@ -23,6 +23,16 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
       DATABASE_URL: postgresql+psycopg://assistant_agent:${POSTGRES_PASSWORD}@db:5432/assistant_agent
+      SANDBOX_CONTAINER: assistant-agent-sandbox-1
+    # docker exec is a call to the daemon socket, not a connection to the container, so
+    # driving the sandbox from here needs the socket -- being on a shared network does not
+    # grant it. Note this is root-equivalent control of the host: anything that executes
+    # code in this container can start a privileged container and mount the host's disk.
+    # The hardening path is a socket proxy restricted to the exec endpoints.
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    # The image runs as uid 10001, which is in no group that can read the socket.
+    # remote.sh resolves the host's docker gid, which differs between AMIs.
+    group_add: ["${DOCKER_GID}"]
     depends_on:
       db: {condition: service_healthy}
   caddy:
@@ -36,3 +46,43 @@ services:
       - /srv/assistant-agent/caddy-data:/data
       - /srv/assistant-agent/caddy-config:/config
     depends_on: [app]
+  # A long-lived, idle container that the app drives with docker exec. It joins the
+  # project's default network, so the app can also reach it as `sandbox-1` once anything
+  # inside it listens; nothing does today -- the image has no EXPOSE and no server.
+  sandbox-1:
+    image: ${SANDBOX_IMAGE_URI}
+    # A fixed name, so exec targets do not depend on Compose's generated suffix.
+    container_name: assistant-agent-sandbox-1
+    hostname: sandbox-1
+    restart: unless-stopped
+    # PID 1 reaping. Without it, an agent's orphaned children accumulate as zombies.
+    init: true
+    # Two independent restrictions, matching how the upstream wrapper runs this image:
+    # no-new-privileges blocks any execve from gaining privilege, and dropping every
+    # capability leaves CapEff reading all zeroes.
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 2048
+    # The cap is the point: a runaway agent is OOM-killed inside its own cgroup rather
+    # than leaving the kernel to choose a victim, which could be PostgreSQL.
+    mem_limit: 2g
+    # A ceiling, not a reservation, so the app is never starved on this 2-vCPU instance.
+    cpus: 1.0
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes: ["/srv/assistant-agent/sandboxes/1:/workspace"]
+    labels: ["assistant-agent.sandbox=1"]
+    # An agent is chatty, and an unbounded json-file log is a realistic way to fill the
+    # root volume.
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+    # The image's CMD is an interactive login shell, which would exit immediately here.
+    # The sentinel is written after the entrypoint seeds git config, so the healthcheck
+    # below reports ready only once setup has finished.
+    command: ["bash", "-c", "touch /tmp/.sandbox-ready && exec sleep infinity"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/.sandbox-ready"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.16,<2",
     "cryptography>=45,<51",
+    "docker>=7,<8",
     "fastapi>=0.141.1",
     "google-api-python-client>=2.200.0",
     "google-auth>=2.58.1",

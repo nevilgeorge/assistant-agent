@@ -24,6 +24,9 @@ SCOPES = [
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 # The agent kit installed into export directories; see assistant_agent.agent_kit.
 AGENT_KIT_DIR = Path(__file__).resolve().parent / "agent_kit"
+# The vendored agent-sandbox build context. Unlike the agent kit, nothing installs this
+# anywhere: deploy/deploy.sh builds it straight from the working tree. See its UPSTREAM.md.
+SANDBOX_KIT_DIR = Path(__file__).resolve().parent / "sandbox_kit"
 DATA_DIR = Path.cwd() / "data"
 TOKENS_PATH = DATA_DIR / "tokens.json"
 

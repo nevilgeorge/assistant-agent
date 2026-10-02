@@ -133,6 +133,25 @@ def _install_kit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sandbox(args: argparse.Namespace) -> int:
+    """Run a command in the sandbox container, or report its status."""
+    import json
+
+    from assistant_agent.sandbox import SandboxError, health, run
+
+    try:
+        if not args.command:
+            status = health()
+            print(json.dumps(status, indent=2))
+            return 0 if status["ok"] else 1
+        result = run(" ".join(args.command))
+    except SandboxError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(result.output, end="" if result.output.endswith("\n") else "\n")
+    return result.exit_code
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -159,6 +178,13 @@ def main() -> None:
     kit.add_argument("--check", action="store_true", help="report drift without writing")
     kit.add_argument("--force", action="store_true", help="overwrite locally modified copies")
     kit.set_defaults(func=_install_kit)
+
+    sandbox = subparsers.add_parser(
+        "sandbox", help="run a command in the agent sandbox container (no command: report status)"
+    )
+    # REMAINDER so flags meant for the inner command are not parsed as ours.
+    sandbox.add_argument("command", nargs=argparse.REMAINDER, help="command to run inside the sandbox")
+    sandbox.set_defaults(func=_sandbox)
 
     args = parser.parse_args()
     handler = getattr(args, "func", _serve)

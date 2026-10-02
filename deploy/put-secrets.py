@@ -1,12 +1,11 @@
 """Write production secrets to SSM without passing values on command lines."""
 import argparse
 import getpass
-import os
 import secrets
 import subprocess
 from cryptography.fernet import Fernet
 
-NAMES = ("google-client-id", "google-client-secret", "credential-encryption-key", "postgres-password")
+NAMES = ("google-client-id", "google-client-secret", "credential-encryption-key", "postgres-password", "anthropic-api-key")
 
 
 def main():
