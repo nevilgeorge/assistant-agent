@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from google.oauth2.credentials import Credentials
 
 from assistant_agent.database import WebSession, utcnow
+from assistant_agent.sandbox import ExecResult, SandboxError
 
 
 @pytest.fixture
@@ -147,3 +148,35 @@ def test_verified_identity_and_nonce(web, monkeypatch):
     monkeypatch.setattr(oauth.id_token, "verify_oauth2_token", lambda *args, **kwargs: {"email": "a@example.com", "email_verified": False, "sub": "stable-sub", "nonce": "expected"})
     with pytest.raises(ValueError, match="not verified"):
         oauth.account_identity(Token(), expected_nonce="expected")
+
+
+def test_message_requires_auth_and_csrf_and_returns_sandbox_response(web, monkeypatch):
+    calls = []
+    monkeypatch.setattr(web.sandbox, "ask", lambda prompt: calls.append(prompt) or ExecResult(0, "Hello!\n"))
+    anonymous = TestClient(web.app)
+    assert anonymous.post("/api/message", json={"message": "Hi"}).status_code == 401
+    client = connect(web, monkeypatch, "sub-a", "a@example.com")
+    assert client.post("/api/message", json={"message": "Hi"}).status_code == 400
+    csrf = web.store.session(client.cookies.get(web.COOKIE)).csrf_token
+    headers = {"X-CSRF-Token": csrf}
+    assert client.post("/api/message", json={"message": "  "}, headers=headers).status_code == 400
+    assert client.post("/api/message", json={"message": "x" * 4001}, headers=headers).status_code == 422
+    response = client.post("/api/message", json={"message": "Hi"}, headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"response": "Hello!"}
+    assert calls == ["Hi"]
+
+
+def test_message_reports_sandbox_failures_without_exposing_details(web, monkeypatch):
+    client = connect(web, monkeypatch, "sub-a", "a@example.com")
+    headers = {"X-CSRF-Token": web.store.session(client.cookies.get(web.COOKIE)).csrf_token}
+    monkeypatch.setattr(web.sandbox, "ask", lambda prompt: ExecResult(124, "private output"))
+    assert client.post("/api/message", json={"message": "Hi"}, headers=headers).status_code == 504
+    monkeypatch.setattr(web.sandbox, "ask", lambda prompt: ExecResult(1, "private output"))
+    failed = client.post("/api/message", json={"message": "Hi"}, headers=headers)
+    assert failed.status_code == 502 and "private output" not in failed.text
+    def unavailable(prompt):
+        raise SandboxError("private daemon detail")
+    monkeypatch.setattr(web.sandbox, "ask", unavailable)
+    failed = client.post("/api/message", json={"message": "Hi"}, headers=headers)
+    assert failed.status_code == 503 and "private daemon detail" not in failed.text

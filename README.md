@@ -4,6 +4,14 @@ FastAPI lets each user connect a Google account for **read-only** Gmail and Goog
 
 The legacy CLI (`assistant-agent accounts`, `verify`, `export-2026`) continues to use local `data/tokens.json` and export files. That store is separate from web users and is not migrated automatically.
 
+Connected users can send a message from the web page. The browser posts to `/api/message`
+with its session cookie and CSRF token. FastAPI runs `claude -p` inside the existing
+`sandbox-1` container through the Docker socket, waits up to two minutes, and returns
+the plain-text answer. Each request is independent: conversation history is not saved.
+The shared sandbox currently runs these web requests with Claude's tools disabled, so
+it cannot read or change workspace files on behalf of a user. Per-user sandboxes are
+needed before enabling file and command tools for web requests.
+
 Alembic revision `0002` assigns an internal `user_id` to existing web users, retains each unique `google_sub`, and updates existing sessions to reference the new key. Run `uv run --env-file .env alembic upgrade head` before starting the updated app locally. The deployment script runs migrations automatically on EC2.
 
 Revision `0003` adds a UUID `id` primary key to web sessions and renames `id_hash` to `session_token_hash`, with a unique index for token lookups. Existing sessions remain valid after migration.
@@ -24,15 +32,17 @@ uv run --env-file .env alembic upgrade head
 uv run assistant-agent serve
 ```
 
-For local Compose, create `deploy/local-db-password.txt` (ignored by Git), put the same password in `.env` as `POSTGRES_PASSWORD`, set `DATABASE_URL` for the host if you use CLI migrations, and run:
+For local Compose, create `deploy/local-db-password.txt` (ignored by Git), put the same password in `.env` as `POSTGRES_PASSWORD`, and set `ANTHROPIC_API_KEY` in `.env`. Start Docker, then run:
 
 ```bash
-docker compose up -d db
-docker compose run --rm app alembic upgrade head
-docker compose up -d app
+./deploy/local.sh
 ```
 
-The local Compose setup exposes only the app on `127.0.0.1:8000`. Local exports remain on disk under `data/` and do not enter the containers.
+The script builds the app and sandbox, discovers Docker socket permissions, runs database migrations, and waits for readiness. Run it again after source changes to rebuild the containers. At `http://localhost:8000`, sign in and use the **Ask the assistant** card. Each request runs Claude in the local sandbox and returns its answer; tools and conversation persistence remain disabled.
+
+The app listens on `127.0.0.1:8000` and PostgreSQL on `127.0.0.1:5432`. The sandbox publishes no ports and has no workspace mount. Local exports under `data/` do not enter the containers. The app mounts the Docker socket to execute commands in the sandbox, matching production; this grants control of the local Docker daemon.
+
+Use `docker compose ps` to inspect services and `docker compose logs app sandbox-1` for diagnostics. Stop with `docker compose down`, which preserves database data. Sandbox recreation discards its files. Set `DATABASE_URL` for the host if you run migrations outside Docker.
 
 ### Agent kit
 

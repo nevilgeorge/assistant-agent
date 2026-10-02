@@ -161,6 +161,18 @@
   .meta { color: var(--fg-subtle); font-size: 0.85rem; }
   .lede { color: var(--fg-muted); margin: 8px 0 0; font-size: 0.92rem; }
 
+  textarea {
+    display: block; width: 100%; margin-top: 8px; padding: 10px 12px;
+    resize: vertical; border: 1px solid var(--border-strong);
+    border-radius: 10px; background: var(--surface); color: var(--fg);
+    font: inherit;
+  }
+  textarea:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring); }
+  .message-response {
+    white-space: pre-wrap; overflow-wrap: anywhere; margin: 16px 0 0;
+    font: inherit;
+  }
+
   /* --- permission rows --- */
 
   .perms { list-style: none; margin: 22px 0 0; padding: 0; display: grid; gap: 2px; }

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 DEFAULT_CONTAINER = "assistant-agent-sandbox-1"
 # The sandbox's WORKDIR, where the host's per-sandbox directory is bind-mounted.
 WORKSPACE = "/workspace"
+REQUEST_TIMEOUT_SECONDS = 120
 
 
 class SandboxError(RuntimeError):
@@ -51,7 +52,8 @@ def _client():
     except ImportError as exc:  # pragma: no cover - dependency is declared
         raise SandboxError("The docker package is not installed.") from exc
     try:
-        return docker.from_env()
+        # A model request may run longer than the SDK's 60-second socket default.
+        return docker.from_env(timeout=REQUEST_TIMEOUT_SECONDS + 15)
     except Exception as exc:
         raise SandboxError(f"Cannot reach the Docker daemon: {exc}") from exc
 
@@ -78,15 +80,18 @@ def run(
     if container.status != "running":
         raise SandboxError(f"Sandbox container {target!r} is {container.status}, not running.")
 
-    result = container.exec_run(
-        ["bash", "-lc", command],
-        workdir=workdir,
-        # The image's own user. Running as root would break Claude Code, which refuses
-        # --dangerously-skip-permissions as root, and would leave root-owned files in the
-        # bind-mounted workspace.
-        user="agent",
-        demux=False,
-    )
+    try:
+        result = container.exec_run(
+            ["bash", "-lc", command],
+            workdir=workdir,
+            # The image's own user. Running as root would break Claude Code, which refuses
+            # --dangerously-skip-permissions as root, and would leave root-owned files in the
+            # bind-mounted workspace.
+            user="agent",
+            demux=False,
+        )
+    except Exception as exc:
+        raise SandboxError(f"Sandbox exec failed: {exc}") from exc
     output = result.output.decode("utf-8", errors="replace") if result.output else ""
     return ExecResult(exit_code=result.exit_code, output=output)
 
@@ -94,6 +99,19 @@ def run(
 def run_argv(argv: list[str], **kwargs) -> ExecResult:
     """`run` for an argument list, quoted so the login shell cannot reinterpret it."""
     return run(shlex.join(argv), **kwargs)
+
+
+def ask(message: str) -> ExecResult:
+    """Send one message to Claude and collect its plain-text response.
+
+    The shared sandbox has no per-user workspace isolation yet, so this mode gives
+    Claude no tools and saves no transcript in the container.
+    """
+    return run_argv([
+        "timeout", "--signal=TERM", "--kill-after=5s", f"{REQUEST_TIMEOUT_SECONDS}s",
+        "claude", "-p", "--output-format", "text", "--no-session-persistence",
+        "--restricted", "--tools", "", "--disallowedTools", "mcp__*", "--", message,
+    ])
 
 
 def health() -> dict:

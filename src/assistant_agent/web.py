@@ -10,8 +10,10 @@ from urllib.parse import urlencode
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from assistant_agent import sandbox
 from assistant_agent.config import ConfigError, SCOPES, TEMPLATES_DIR, get_settings
 from assistant_agent.google_oauth import account_identity, authorization_url, exchange_code, revoke
 from assistant_agent.web_store import WebStore
@@ -24,6 +26,10 @@ store = WebStore()
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 app = FastAPI(title="assistant-agent")
 COOKIE = "assistant_agent_session"
+
+
+class MessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
 
 
 def _cookie(response, token: str) -> None:
@@ -106,6 +112,29 @@ async def disconnect(request: Request):
     response = RedirectResponse("/", status_code=303)
     response.delete_cookie(COOKIE, path="/")
     return response
+
+
+@app.post("/api/message")
+def message(request: Request, body: MessageRequest):
+    session = store.session(request.cookies.get(COOKIE))
+    if session is None or not session.user_id or store.user(session.user_id) is None:
+        return JSONResponse({"error": "Authentication required."}, status_code=401)
+    supplied = request.headers.get("x-csrf-token", "")
+    if not hmac.compare_digest(session.csrf_token, supplied):
+        return _bad_request("CSRF token mismatch.")
+    if not body.message.strip():
+        return _bad_request("Message cannot be blank.")
+    try:
+        result = sandbox.ask(body.message)
+    except sandbox.SandboxError:
+        logger.exception("Sandbox request failed")
+        return JSONResponse({"error": "The assistant is unavailable."}, status_code=503)
+    if result.exit_code == 124:
+        return JSONResponse({"error": "The assistant timed out."}, status_code=504)
+    if not result.ok:
+        logger.error("Sandbox command exited with code %s", result.exit_code)
+        return JSONResponse({"error": "The assistant could not complete the request."}, status_code=502)
+    return {"response": result.output.strip()}
 
 
 @app.get("/healthz")

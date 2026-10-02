@@ -53,6 +53,49 @@
 </div>
 {% endfor %}
 
+<div class="card">
+  <h2>Ask the assistant</h2>
+  <form id="message-form" data-csrf-token="{{ csrf_token }}">
+    <label for="message-input">Message</label>
+    <textarea id="message-input" name="message" rows="4" maxlength="4000" required></textarea>
+    <div class="actions"><button class="btn" type="submit">Send</button></div>
+  </form>
+  <p id="message-status" class="lede" role="status" aria-live="polite"></p>
+  <pre id="message-response" class="message-response" hidden></pre>
+</div>
+
+<script>
+  const form = document.getElementById("message-form");
+  const status = document.getElementById("message-status");
+  const response = document.getElementById("message-response");
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = form.querySelector("button");
+    button.disabled = true;
+    status.textContent = "Waiting for the assistant…";
+    response.hidden = true;
+    try {
+      const result = await fetch("/api/message", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": form.dataset.csrfToken,
+        },
+        body: JSON.stringify({message: form.elements.message.value}),
+      });
+      const data = await result.json();
+      if (!result.ok) throw new Error(data.error || "Request failed.");
+      response.textContent = data.response;
+      response.hidden = false;
+      status.textContent = "";
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+
 {% endblock %}
 
 {% block footer %}
