@@ -91,11 +91,39 @@ The root volume is 30 GiB rather than the AMI's 8 GiB default: it holds `/var/li
 
 1. Install Terraform, AWS CLI, and Docker Buildx. Configure AWS credentials locally.
 2. Choose a globally unique state bucket name and run `terraform -chdir=terraform/bootstrap init`, then `terraform -chdir=terraform/bootstrap apply -var='state_bucket_name=YOUR_BUCKET'`. The bucket is versioned and encrypted.
-3. Run `terraform -chdir=terraform/main init -backend-config='bucket=YOUR_BUCKET'` and `terraform -chdir=terraform/main apply`. The [S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3) uses S3 lockfiles. Save the five Terraform outputs.
+3. Run `terraform -chdir=terraform/main init -backend-config='bucket=YOUR_BUCKET'`, then review `terraform -chdir=terraform/main plan` before running `terraform -chdir=terraform/main apply`. The [S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3) uses S3 lockfiles. `terraform/main/terraform.tfvars` names the separate application-data bucket. Save the six Terraform outputs.
 4. Point the chosen domain's A record to `elastic_ip`, create the production Google OAuth callback URL, and add the domain to the consent screen.
 5. Run `uv run python deploy/put-secrets.py`. It prompts for Google client ID and secret and the Anthropic API key, and can generate the Fernet key and PostgreSQL password. Values are written directly to SSM SecureString, outside Terraform state. Do this before deploying: `deploy/remote.sh` aborts if a parameter is missing.
 6. If the root volume was just resized, grow its filesystem before deploying — `terraform apply` resizes the block device but the instance does not reboot, so cloud-init's `growpart` never runs. Over Session Manager: `sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs /`, then check `df -h /`. Skipping this can exhaust the old 8 GiB volume partway through pulling the 1.9 GiB sandbox image.
 7. Export `DOMAIN`, `INSTANCE_ID`, `ECR_REPOSITORY_URL`, `SANDBOX_ECR_REPOSITORY_URL`, and `DATA_VOLUME_ID` from Terraform outputs; then run `deploy/deploy.sh`. It builds and pushes two Linux ARM64 images — the app and the agent sandbox, sharing one tag — sends a [Run Command](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command.html) to the instance, mounts the retained EBS volume, fetches secrets, runs Alembic, starts Compose, and checks HTTPS readiness. ECR authentication uses [AWS's registry login flow](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry_auth.html).
+
+### Manual export upload
+
+After Terraform creates the application-data bucket, run the following command from the checkout containing your local `data/` directory. A fresh Git worktree does not have `data/` because Git ignores it. The dry run lists the files that would be uploaded; review it, then run the same command without `--dryrun`.
+
+```bash
+aws s3 sync data/ \
+  s3://assistant-agent-data-051638360892-staging/user-data/811add5cd1414fee9baa097c41d7bd41/ \
+  --exclude '*' \
+  --include 'emails/2026/*' \
+  --include 'calendar/2026/*' \
+  --include 'emails/CLAUDE.md' \
+  --include 'emails/build_index.py' \
+  --include 'emails/decode_email_bodies.py' \
+  --include 'calendar/CLAUDE.md' \
+  --include 'calendar/build_index.py' \
+  --include 'export-2026*-report.json' \
+  --include '.agent-kit.json' \
+  --dryrun
+```
+
+The allowlist omits `tokens.json`, generated indexes, and caches. The sync does not delete objects already in S3. After uploading, check the destination with:
+
+```bash
+aws s3 ls s3://assistant-agent-data-051638360892-staging/user-data/811add5cd1414fee9baa097c41d7bd41/ --recursive --summarize
+```
+
+Bucket versioning retains overwritten and deleted object versions, which incur S3 storage charges. The CLI and application still use local `data/`; this upload does not change their storage behavior.
 
 ### The agent sandbox
 
