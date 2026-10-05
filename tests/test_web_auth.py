@@ -344,7 +344,10 @@ async def test_stream_replays_events_after_snapshot(web, monkeypatch):
     assert '"type": "conversation_reset"' in response.text
     assert "id: 1" in response.text
     page = (await client.get("/")).text
-    assert "content.textContent += data.text" in page
+    assert "renderMessage(content, content.dataset.text + data.text)" in page
+    parser = await client.get("/static/vendor/markdown-it-14.1.0.min.js")
+    assert parser.status_code == 200
+    assert "markdown-it" in parser.text
 
 
 @pytest.mark.parametrize("operation", ["database", "google", "chat"])

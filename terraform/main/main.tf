@@ -280,6 +280,9 @@ resource "aws_instance" "app" {
   monitoring = true
   # Add the project name as the resource’s Name tag alongside the shared Project tag.
   tags       = merge(local.tags, { Name = var.name })
+  # Ignore the public-IP flag after creation: once the Elastic IP below is associated, EC2
+  # reports it as true, and the mismatch with the false above would force a replacement.
+  lifecycle { ignore_changes = [associate_public_ip_address] }
 }
 # Attach the persistent data volume to the application instance.
 resource "aws_volume_attachment" "data" {

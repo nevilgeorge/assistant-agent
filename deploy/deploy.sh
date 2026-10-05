@@ -1,10 +1,26 @@
 #!/bin/bash
 set -euo pipefail
-: "${DOMAIN:?Set DOMAIN after pointing its DNS A record to the Terraform elastic_ip output}"
-: "${INSTANCE_ID:?Set INSTANCE_ID from Terraform output}"
-: "${ECR_REPOSITORY_URL:?Set ECR_REPOSITORY_URL from Terraform output}"
-: "${SANDBOX_ECR_REPOSITORY_URL:?Set SANDBOX_ECR_REPOSITORY_URL from Terraform output}"
-: "${DATA_VOLUME_ID:?Set DATA_VOLUME_ID from Terraform output}"
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+terraform_output() {
+  local value
+  if ! value=$(terraform -chdir="$repo_root/terraform/main" output -raw "$1"); then
+    echo "Could not read Terraform output '$1'. Initialize and apply terraform/main before deploying." >&2
+    return 1
+  fi
+  if [[ -z "$value" || "$value" == "null" ]]; then
+    echo "Terraform output '$1' is empty. Apply terraform/main before deploying." >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+DOMAIN=${DOMAIN:-assistant.nevilgeorge.me}
+INSTANCE_ID=${INSTANCE_ID:-$(terraform_output instance_id)}
+ECR_REPOSITORY_URL=${ECR_REPOSITORY_URL:-$(terraform_output ecr_repository_url)}
+SANDBOX_ECR_REPOSITORY_URL=${SANDBOX_ECR_REPOSITORY_URL:-$(terraform_output sandbox_ecr_repository_url)}
+DATA_VOLUME_ID=${DATA_VOLUME_ID:-$(terraform_output data_volume_id)}
 region=${AWS_REGION:-us-east-1}
 registry=${ECR_REPOSITORY_URL%%/*}
 tag=$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)

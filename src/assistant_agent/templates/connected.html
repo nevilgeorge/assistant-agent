@@ -71,13 +71,16 @@
   <p id="message-status" class="lede chat-status" role="status" aria-live="polite"></p>
   <form id="message-form" class="chat-composer" data-csrf-token="{{ csrf_token }}">
     <label for="message-input">Message</label>
-    <textarea id="message-input" name="message" rows="2" maxlength="4000" placeholder="Write your message…" required></textarea>
+    <textarea id="message-input" name="message" rows="2" maxlength="4000" placeholder="Write your message…" aria-describedby="message-input-hint" required></textarea>
+    <p id="message-input-hint" class="lede">Enter to send · Shift+Enter for a new line</p>
     <div class="actions"><button class="btn" type="submit">Send</button></div>
   </form>
 </section>
 </div>
 
+<script src="{{ url_for('static', path='vendor/markdown-it-14.1.0.min.js') }}"></script>
 <script>
+const markdown = window.markdownit({html: false, breaks: true, linkify: true});
 const form = document.getElementById("message-form");
 const status = document.getElementById("message-status");
 const transcript = document.getElementById("message-response");
@@ -85,6 +88,10 @@ const send = form.querySelector("button[type=submit]");
 const reset = document.getElementById("reset-chat");
 const headers = {"Content-Type": "application/json", "X-CSRF-Token": form.dataset.csrfToken};
 const rows = new Map();
+function renderMessage(content, text) {
+  content.dataset.text = text;
+  content.innerHTML = markdown.render(text);
+}
 let source, conversationId, active = false, failed = false, loading = true, submitting = false;
 function controls() { send.disabled = loading || submitting || active || failed; }
 function nearBottom() { return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80; }
@@ -105,8 +112,9 @@ function row(role, text, turn, pending = active) {
   const body = document.createElement("div"); body.className = "chat-message-body";
   const label = document.createElement("strong"); label.className = "chat-sender";
   label.textContent = role === "user" ? "You" : "Assistant";
-  const content = document.createElement("pre");
-  content.className = "chat-bubble"; content.textContent = text || (role === "assistant" ? "No response text." : "");
+  const content = document.createElement("div");
+  content.className = "chat-bubble";
+  renderMessage(content, text || (role === "assistant" ? "No response text." : ""));
   if (role === "assistant" && !text && pending) {
     content.textContent = "Responding…"; content.classList.add("is-pending");
   }
@@ -150,8 +158,8 @@ async function load(notice = "") {
         const content = rows.get(data.turn_id);
         if (content) {
           const follow = nearBottom();
-          if (content.classList.contains("is-pending")) { content.textContent = ""; content.classList.remove("is-pending"); }
-          content.textContent += data.text; followMessages(follow);
+          if (content.classList.contains("is-pending")) { content.dataset.text = ""; content.classList.remove("is-pending"); }
+          renderMessage(content, content.dataset.text + data.text); followMessages(follow);
         }
       } else if (data.type === "turn_completion") { finishPlaceholder(data.turn_id); active = false; status.textContent = "";
       } else if (data.type === "turn_failure") { finishPlaceholder(data.turn_id, "Response interrupted."); active = false; failed = true; status.textContent = data.message; }
@@ -162,8 +170,16 @@ async function load(notice = "") {
   } catch (error) { status.textContent = error.message; failed = true;
   } finally { loading = false; controls(); }
 }
+form.elements.message.addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    if (!send.disabled) form.requestSubmit(send);
+  }
+});
 form.addEventListener("submit", async event => {
-  event.preventDefault(); submitting = true; controls();
+  event.preventDefault();
+  if (send.disabled || !form.elements.message.value.trim()) return;
+  submitting = true; controls();
   try {
     await request("/api/message", {method: "POST", headers, body: JSON.stringify({message: form.elements.message.value, conversation_id: conversationId})});
     form.elements.message.value = "";

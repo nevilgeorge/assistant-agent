@@ -16,6 +16,7 @@ from fastapi import APIRouter, FastAPI, Request
 from anyio import CancelScope
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     application = FastAPI(title="assistant-agent", lifespan=lifespan)
     application.include_router(router)
+    application.mount("/static", StaticFiles(directory=TEMPLATES_DIR.parent / "static"), name="static")
     return application
 
 
