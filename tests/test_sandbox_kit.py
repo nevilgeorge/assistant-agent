@@ -92,6 +92,23 @@ def test_run_argv_quotes_its_arguments(monkeypatch) -> None:
     assert seen["command"] == "echo 'a b; rm -rf /'"
 
 
+def test_ask_passes_message_as_one_argument_without_tools(monkeypatch) -> None:
+    seen = {}
+
+    def fake_run_argv(argv):
+        seen["argv"] = argv
+        return sandbox.ExecResult(0, "answer")
+
+    monkeypatch.setattr(sandbox, "run_argv", fake_run_argv)
+    prompt = "--help; $(touch /tmp/unwanted)"
+    assert sandbox.ask(prompt).output == "answer"
+    assert seen["argv"][-1] == prompt
+    # Claude's variadic tool flags must not consume the prompt, even if it starts '-'.
+    assert seen["argv"][-2] == "--"
+    assert "--no-session-persistence" in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--tools") + 1] == ""
+
+
 def test_workspace_matches_the_image_workdir() -> None:
     """The bind mount in compose.prod.yaml targets this path."""
     assert sandbox.WORKSPACE == "/workspace"

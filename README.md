@@ -4,6 +4,29 @@ FastAPI lets each user connect a Google account for **read-only** Gmail and Goog
 
 The legacy CLI (`assistant-agent accounts`, `verify`, `export-2026`) continues to use local `data/tokens.json` and export files. That store is separate from web users and is not migrated automatically.
 
+Connected users share one live Claude conversation across their tabs and logins. The app
+keeps a non-TTY Docker exec open per user in the existing `sandbox-1` container, sends
+newline-delimited JSON prompts to stdin, and continuously reads structured stdout.
+`POST /api/message` accepts a prompt with the session cookie and CSRF token and returns
+`202` with conversation/turn IDs. `GET /api/conversation` returns the in-memory transcript;
+`GET /api/conversation/stream?conversation_id=...&after=...` streams SSE text deltas and
+turn events, with sequence-based replay. `POST /api/conversation/reset` starts fresh.
+The browser uses plain text rendering and the **New conversation** button to reset.
+
+Turns continue if the browser disconnects. Overlapping prompts return `409`; turns have
+a two-minute deadline. Idle conversations expire after 30 minutes. All conversations
+and context are lost on app restart; there is no disk persistence or automatic retry.
+A failed CLI session requires a new conversation. Tools and MCP remain disabled, so
+Claude cannot read or change workspace files. Per-user sandboxes are needed before
+enabling file and command tools for web requests.
+
+Run exactly one app worker/replica per sandbox: the session manager is process-local
+and startup cleans up earlier chat process groups. Configure `CHAT_MAX_SESSIONS`
+(default `4`) and `CHAT_IDLE_SECONDS` (default `1800`) in the app environment. Each
+conversation accepts up to 2 MiB of cumulative prompt/response text. SSE clients replay
+up to 2048 recent events; clients behind that window reload the transcript snapshot.
+These limits also bound sessions without active CLI processes.
+
 Alembic revision `0002` assigns an internal `user_id` to existing web users, retains each unique `google_sub`, and updates existing sessions to reference the new key. Run `uv run --env-file .env alembic upgrade head` before starting the updated app locally. The deployment script runs migrations automatically on EC2.
 
 Revision `0003` adds a UUID `id` primary key to web sessions and renames `id_hash` to `session_token_hash`, with a unique index for token lookups. Existing sessions remain valid after migration.
@@ -24,15 +47,17 @@ uv run --env-file .env alembic upgrade head
 uv run assistant-agent serve
 ```
 
-For local Compose, create `deploy/local-db-password.txt` (ignored by Git), put the same password in `.env` as `POSTGRES_PASSWORD`, set `DATABASE_URL` for the host if you use CLI migrations, and run:
+For local Compose, create `deploy/local-db-password.txt` (ignored by Git), put the same password in `.env` as `POSTGRES_PASSWORD`, and set `ANTHROPIC_API_KEY` in `.env`. Start Docker, then run:
 
 ```bash
-docker compose up -d db
-docker compose run --rm app alembic upgrade head
-docker compose up -d app
+./deploy/local.sh
 ```
 
-The local Compose setup exposes only the app on `127.0.0.1:8000`. Local exports remain on disk under `data/` and do not enter the containers.
+The script builds the app and sandbox, discovers Docker socket permissions, runs database migrations, and waits for readiness. Run it again after source changes to rebuild the containers. At `http://localhost:8000`, sign in and use the **Ask the assistant** card. Claude stays running across turns and streams responses into the chat transcript; tools and disk persistence remain disabled.
+
+The app listens on `127.0.0.1:8000` and PostgreSQL on `127.0.0.1:5432`. The sandbox publishes no ports and has no workspace mount. Local exports under `data/` do not enter the containers. The app mounts the Docker socket to execute commands in the sandbox, matching production; this grants control of the local Docker daemon.
+
+Use `docker compose ps` to inspect services and `docker compose logs app sandbox-1` for diagnostics. Stop with `docker compose down`, which preserves database data. Sandbox recreation discards its files. Set `DATABASE_URL` for the host if you run migrations outside Docker.
 
 ### Agent kit
 
@@ -163,3 +188,16 @@ terraform -chdir=terraform/main validate
 bash -n deploy/remote.sh && bash -n deploy/deploy.sh
 docker buildx build --platform linux/arm64 -f src/assistant_agent/sandbox_kit/Dockerfile src/assistant_agent/sandbox_kit
 ```
+
+### Live chat integration check
+
+With the existing sandbox running and authenticated, run the opt-in two-turn test:
+
+```bash
+CHAT_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_chat.py -k real_claude
+```
+
+This makes real model requests. Normal tests use a fake Claude process and do not
+require Docker or provider credentials. Production SSE/proxy behavior must also be
+checked after deploying: confirm incremental text, reload/reconnect, and safe plain-text
+rendering.

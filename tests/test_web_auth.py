@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from google.oauth2.credentials import Credentials
 
 from assistant_agent.database import WebSession, utcnow
+from assistant_agent.chat import ChatError
 
 
 @pytest.fixture
@@ -24,6 +25,7 @@ def web(tmp_path, monkeypatch):
     from assistant_agent.database import Base
     Base.metadata.create_all(module.store.factory.kw['bind'])
     yield module
+    module.chat.close()
     config.get_settings.cache_clear()
 
 
@@ -147,3 +149,86 @@ def test_verified_identity_and_nonce(web, monkeypatch):
     monkeypatch.setattr(oauth.id_token, "verify_oauth2_token", lambda *args, **kwargs: {"email": "a@example.com", "email_verified": False, "sub": "stable-sub", "nonce": "expected"})
     with pytest.raises(ValueError, match="not verified"):
         oauth.account_identity(Token(), expected_nonce="expected")
+
+
+def test_message_requires_auth_and_csrf_and_returns_sandbox_response(web, monkeypatch):
+    calls = []
+    monkeypatch.setattr(web.chat, "submit", lambda user, prompt, conversation_id: calls.append(prompt) or {"conversation_id": "chat", "turn_id": "turn"})
+    anonymous = TestClient(web.app)
+    assert anonymous.post("/api/message", json={"message": "Hi"}).status_code == 401
+    client = connect(web, monkeypatch, "sub-a", "a@example.com")
+    assert client.post("/api/message", json={"message": "Hi"}).status_code == 400
+    csrf = web.store.session(client.cookies.get(web.COOKIE)).csrf_token
+    headers = {"X-CSRF-Token": csrf}
+    assert client.post("/api/message", json={"message": "  "}, headers=headers).status_code == 400
+    assert client.post("/api/message", json={"message": "x" * 4001}, headers=headers).status_code == 422
+    response = client.post("/api/message", json={"message": "Hi"}, headers=headers)
+    assert response.status_code == 202
+    assert response.json() == {"conversation_id": "chat", "turn_id": "turn"}
+    assert calls == ["Hi"]
+
+
+def test_message_reports_sandbox_failures_without_exposing_details(web, monkeypatch):
+    client = connect(web, monkeypatch, "sub-a", "a@example.com")
+    headers = {"X-CSRF-Token": web.store.session(client.cookies.get(web.COOKIE)).csrf_token}
+
+    def unavailable(*args):
+        raise ChatError("The assistant is unavailable.", 503)
+
+    monkeypatch.setattr(web.chat, "submit", unavailable)
+    failed = client.post("/api/message", json={"message": "Hi"}, headers=headers)
+    assert failed.status_code == 503
+
+
+def test_conversation_snapshot_isolation_reset_and_disconnect(web, monkeypatch):
+    a = connect(web, monkeypatch, "sub-a", "a@example.com")
+    b = connect(web, monkeypatch, "sub-b", "b@example.com")
+    first = a.get("/api/conversation").json()
+    assert b.get("/api/conversation").json()["conversation_id"] != first["conversation_id"]
+    assert TestClient(web.app).get("/api/conversation").status_code == 401
+    assert a.post("/api/conversation/reset").status_code == 400
+    csrf = web.store.session(a.cookies.get(web.COOKIE)).csrf_token
+    assert a.post("/api/conversation/reset", headers={"X-CSRF-Token": csrf}).status_code == 200
+    assert a.get("/api/conversation").json()["conversation_id"] != first["conversation_id"]
+    monkeypatch.setattr(web, "revoke", lambda creds: True)
+    user = web.store.user_by_google_sub("sub-a").user_id
+    assert a.post("/disconnect", data={"csrf_token": csrf}, follow_redirects=False).status_code == 303
+    assert user not in web.chat.sessions
+
+
+def test_stream_reloads_stale_conversation_and_enforces_auth(web, monkeypatch):
+    anonymous = TestClient(web.app)
+    assert anonymous.get("/api/conversation/stream?conversation_id=old").status_code == 401
+    client = connect(web, monkeypatch, "sub-a", "a@example.com")
+    response = client.get("/api/conversation/stream?conversation_id=old")
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"type": "reload"' in response.text
+    assert response.headers["x-accel-buffering"] == "no"
+
+
+def test_stream_replays_events_after_snapshot(web, monkeypatch):
+    from assistant_agent.chat import SessionManager
+    from test_chat import FakeProcess
+
+    web.chat = SessionManager(FakeProcess)
+    client = connect(web, monkeypatch, "sub-a", "a@example.com")
+    snapshot = client.get("/api/conversation").json()
+    csrf = web.store.session(client.cookies.get(web.COOKIE)).csrf_token
+    submitted = client.post("/api/message", json={"message": "Hi"},
+                            headers={"X-CSRF-Token": csrf})
+    assert submitted.status_code == 202
+    user = web.store.user_by_google_sub("sub-a").user_id
+    session = web.chat.get(user)
+    session.process.text("<script>alert(1)</script>")
+    session.process.finish()
+    # A final reset closes this finite stream, letting TestClient collect the replay.
+    session.close()
+    response = client.get("/api/conversation/stream", params={
+        "conversation_id": snapshot["conversation_id"], "after": snapshot["sequence"]})
+    assert '"type": "turn_start"' in response.text
+    assert '"type": "assistant_delta"' in response.text
+    assert '"type": "turn_completion"' in response.text
+    assert '"type": "conversation_reset"' in response.text
+    assert 'id: 1' in response.text
+    page = client.get("/").text
+    assert 'content.textContent += data.text' in page
