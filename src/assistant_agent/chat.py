@@ -19,13 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 class ChatError(RuntimeError):
+    """A user-facing chat error with the HTTP status returned by the web API."""
+
     def __init__(self, message, status=409):
         super().__init__(message)
         self.status = status
 
 
 class DockerFrames:
-    """Incremental Docker non-TTY stdout/stderr demultiplexer."""
+    """Decode Docker's multiplexed non-TTY stdout/stderr frames incrementally.
+
+    Retain incomplete headers and payloads between reads and yield complete
+    (stream ID, payload) pairs, rejecting invalid stream IDs or oversized frames.
+    """
+
     def __init__(self):
         self.buffer = bytearray()
 
@@ -43,6 +50,14 @@ class DockerFrames:
 
 
 class ClaudeProcess:
+    """Own one long-lived Claude CLI process and its attached Docker exec socket.
+
+    Send newline-delimited JSON prompts without closing stdin between turns.
+    A background reader decodes stdout events and invokes the receive or failure
+    callback while draining stderr. Closing terminates the process group and
+    releases the socket and Docker client; concurrent closes are safe.
+    """
+
     def __init__(self, token, receive, failed):
         self.client = sandbox._client()
         self.closed = False
@@ -151,6 +166,14 @@ def cleanup_orphans():
 
 
 class Conversation:
+    """Keep a live conversation's transcript, turn state, and bounded event replay.
+
+    Normalize Claude output into sequenced events for browser streaming, retain
+    partial responses on failure, and track the active turn's deadline. A condition
+    protects in-memory state; process I/O runs outside it. State is not persisted
+    and the conversation's lifetime is independent of browser connections.
+    """
+
     def __init__(self):
         self.id = uuid.uuid4().hex
         self.transcript = []
@@ -267,6 +290,14 @@ class Conversation:
 
 
 class SessionManager:
+    """Own one live conversation per user within a single app worker.
+
+    Lazily start Claude processes, enforce capacity and one active turn per
+    conversation, and retire sessions on reset, idle expiry, or shutdown. Startup
+    cleans up orphaned processes before new ones are spawned. State locks exclude
+    process I/O; multiple workers must not share this manager's sandbox.
+    """
+
     def __init__(self, process_factory=ClaudeProcess):
         self.factory = process_factory
         self.sessions = {}
