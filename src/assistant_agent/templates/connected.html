@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block main_class %}connected-page{% endblock %}
 {% block content %}
 
 <header class="masthead">
@@ -15,6 +16,8 @@
   </p>
 </header>
 
+<div class="connected-layout">
+<aside class="account-sidebar" aria-label="Connected accounts">
 {% for account in accounts %}
 <div class="card">
   <div class="card-head">
@@ -52,48 +55,131 @@
   </details>
 </div>
 {% endfor %}
+</aside>
 
-<div class="card">
-  <h2>Ask the assistant</h2>
-  <form id="message-form" data-csrf-token="{{ csrf_token }}">
+<section class="card chat-card" aria-labelledby="chat-heading">
+  <div class="chat-header">
+    <div>
+      <h2 id="chat-heading">Ask the assistant</h2>
+      <p class="lede">Your conversation</p>
+    </div>
+    <button class="btn btn-quiet" id="reset-chat" type="button">New conversation</button>
+  </div>
+  <div id="message-response" class="chat-transcript" role="region" aria-label="Conversation messages" tabindex="0">
+    <div class="chat-empty"><strong>What would you like to discuss?</strong><p>Send a message to start your conversation.</p></div>
+  </div>
+  <p id="message-status" class="lede chat-status" role="status" aria-live="polite"></p>
+  <form id="message-form" class="chat-composer" data-csrf-token="{{ csrf_token }}">
     <label for="message-input">Message</label>
-    <textarea id="message-input" name="message" rows="4" maxlength="4000" required></textarea>
+    <textarea id="message-input" name="message" rows="2" maxlength="4000" placeholder="Write your message…" required></textarea>
     <div class="actions"><button class="btn" type="submit">Send</button></div>
   </form>
-  <p id="message-status" class="lede" role="status" aria-live="polite"></p>
-  <pre id="message-response" class="message-response" hidden></pre>
+</section>
 </div>
 
 <script>
-  const form = document.getElementById("message-form");
-  const status = document.getElementById("message-status");
-  const response = document.getElementById("message-response");
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const button = form.querySelector("button");
-    button.disabled = true;
-    status.textContent = "Waiting for the assistant…";
-    response.hidden = true;
-    try {
-      const result = await fetch("/api/message", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRF-Token": form.dataset.csrfToken,
-        },
-        body: JSON.stringify({message: form.elements.message.value}),
-      });
-      const data = await result.json();
-      if (!result.ok) throw new Error(data.error || "Request failed.");
-      response.textContent = data.response;
-      response.hidden = false;
-      status.textContent = "";
-    } catch (error) {
-      status.textContent = error.message;
-    } finally {
-      button.disabled = false;
-    }
-  });
+const form = document.getElementById("message-form");
+const status = document.getElementById("message-status");
+const transcript = document.getElementById("message-response");
+const send = form.querySelector("button[type=submit]");
+const reset = document.getElementById("reset-chat");
+const headers = {"Content-Type": "application/json", "X-CSRF-Token": form.dataset.csrfToken};
+const rows = new Map();
+let source, conversationId, active = false, failed = false, loading = true, submitting = false;
+function controls() { send.disabled = loading || submitting || active || failed; }
+function nearBottom() { return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80; }
+function followMessages(follow) { if (follow) transcript.scrollTop = transcript.scrollHeight; }
+function emptyState() {
+  const empty = document.createElement("div"); empty.className = "chat-empty";
+  const title = document.createElement("strong"); title.textContent = "What would you like to discuss?";
+  const hint = document.createElement("p"); hint.textContent = "Send a message to start your conversation.";
+  empty.append(title, hint); transcript.append(empty);
+}
+function row(role, text, turn, pending = active) {
+  const follow = nearBottom();
+  const empty = transcript.querySelector(".chat-empty"); if (empty) empty.remove();
+  const message = document.createElement("article");
+  message.className = `chat-message chat-message-${role === "user" ? "user" : "assistant"}`;
+  const avatar = document.createElement("span"); avatar.className = "chat-avatar";
+  avatar.textContent = role === "user" ? "YOU" : "AI"; avatar.setAttribute("aria-hidden", "true");
+  const body = document.createElement("div"); body.className = "chat-message-body";
+  const label = document.createElement("strong"); label.className = "chat-sender";
+  label.textContent = role === "user" ? "You" : "Assistant";
+  const content = document.createElement("pre");
+  content.className = "chat-bubble"; content.textContent = text || (role === "assistant" ? "No response text." : "");
+  if (role === "assistant" && !text && pending) {
+    content.textContent = "Responding…"; content.classList.add("is-pending");
+  }
+  body.append(label, content); message.append(avatar, body); transcript.append(message);
+  if (role === "assistant") rows.set(turn, content);
+  followMessages(follow);
+}
+function finishPlaceholder(turn, text = "No response text.") {
+  const content = rows.get(turn);
+  if (content && content.classList.contains("is-pending")) {
+    const follow = nearBottom();
+    content.classList.remove("is-pending"); content.textContent = text; followMessages(follow);
+  }
+}
+async function request(url, options) {
+  const result = await fetch(url, options); const data = await result.json();
+  if (!result.ok) throw new Error(data.error || "Request failed.");
+  return data;
+}
+async function load(notice = "") {
+  if (source) source.close(); loading = true; controls();
+  try {
+    const snapshot = await request("/api/conversation");
+    const previous = sessionStorage.getItem("chat-conversation");
+    conversationId = snapshot.conversation_id;
+    sessionStorage.setItem("chat-conversation", conversationId);
+    transcript.replaceChildren(); rows.clear();
+    active = Boolean(snapshot.active_turn); failed = snapshot.failed;
+    for (const m of snapshot.transcript) row(m.role, m.text, m.turn_id, m.turn_id === snapshot.active_turn);
+    if (!snapshot.transcript.length) emptyState();
+    followMessages(true);
+    status.textContent = notice || (previous && previous !== conversationId ? "Your conversation was reset or expired." : failed ? "Session ended. Start a new conversation." : active ? "Assistant is responding…" : "");
+    source = new EventSource(`/api/conversation/stream?conversation_id=${encodeURIComponent(conversationId)}&after=${snapshot.sequence}`);
+    source.onmessage = event => {
+      const data = JSON.parse(event.data);
+      if (data.type === "reload" || data.type === "conversation_reset") { source.close(); load(data.message); return; }
+      if (data.type === "turn_start") {
+        active = true; row("user", data.text, data.turn_id); row("assistant", "", data.turn_id);
+        status.textContent = "Assistant is responding…";
+      } else if (data.type === "assistant_delta") {
+        const content = rows.get(data.turn_id);
+        if (content) {
+          const follow = nearBottom();
+          if (content.classList.contains("is-pending")) { content.textContent = ""; content.classList.remove("is-pending"); }
+          content.textContent += data.text; followMessages(follow);
+        }
+      } else if (data.type === "turn_completion") { finishPlaceholder(data.turn_id); active = false; status.textContent = "";
+      } else if (data.type === "turn_failure") { finishPlaceholder(data.turn_id, "Response interrupted."); active = false; failed = true; status.textContent = data.message; }
+      controls();
+    };
+    source.onerror = () => { status.textContent = "Connection interrupted. Reconnecting…"; };
+    source.onopen = () => { if (!failed) status.textContent = active ? "Assistant is responding…" : ""; };
+  } catch (error) { status.textContent = error.message; failed = true;
+  } finally { loading = false; controls(); }
+}
+form.addEventListener("submit", async event => {
+  event.preventDefault(); submitting = true; controls();
+  try {
+    await request("/api/message", {method: "POST", headers, body: JSON.stringify({message: form.elements.message.value, conversation_id: conversationId})});
+    form.elements.message.value = "";
+  } catch (error) { status.textContent = error.message;
+  } finally { submitting = false; controls(); }
+});
+reset.addEventListener("click", async () => {
+  reset.disabled = true;
+  try {
+    if (source) source.close();
+    await request("/api/conversation/reset", {method: "POST", headers});
+    await load("Started a new conversation.");
+  } catch (error) { status.textContent = error.message;
+  } finally { reset.disabled = false; }
+});
+load();
 </script>
 
 {% endblock %}

@@ -25,6 +25,8 @@ services:
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
       DATABASE_URL: postgresql+psycopg://assistant_agent:${POSTGRES_PASSWORD}@db:5432/assistant_agent
       SANDBOX_CONTAINER: assistant-agent-sandbox-1
+      CHAT_MAX_SESSIONS: ${CHAT_MAX_SESSIONS:-4}
+      CHAT_IDLE_SECONDS: ${CHAT_IDLE_SECONDS:-1800}
     volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
     # deploy/local.sh discovers this inside Docker, including Docker Desktop/OrbStack.
     group_add: ["${DOCKER_GID:-0}"]

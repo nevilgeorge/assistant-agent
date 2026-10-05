@@ -4,13 +4,28 @@ FastAPI lets each user connect a Google account for **read-only** Gmail and Goog
 
 The legacy CLI (`assistant-agent accounts`, `verify`, `export-2026`) continues to use local `data/tokens.json` and export files. That store is separate from web users and is not migrated automatically.
 
-Connected users can send a message from the web page. The browser posts to `/api/message`
-with its session cookie and CSRF token. FastAPI runs `claude -p` inside the existing
-`sandbox-1` container through the Docker socket, waits up to two minutes, and returns
-the plain-text answer. Each request is independent: conversation history is not saved.
-The shared sandbox currently runs these web requests with Claude's tools disabled, so
-it cannot read or change workspace files on behalf of a user. Per-user sandboxes are
-needed before enabling file and command tools for web requests.
+Connected users share one live Claude conversation across their tabs and logins. The app
+keeps a non-TTY Docker exec open per user in the existing `sandbox-1` container, sends
+newline-delimited JSON prompts to stdin, and continuously reads structured stdout.
+`POST /api/message` accepts a prompt with the session cookie and CSRF token and returns
+`202` with conversation/turn IDs. `GET /api/conversation` returns the in-memory transcript;
+`GET /api/conversation/stream?conversation_id=...&after=...` streams SSE text deltas and
+turn events, with sequence-based replay. `POST /api/conversation/reset` starts fresh.
+The browser uses plain text rendering and the **New conversation** button to reset.
+
+Turns continue if the browser disconnects. Overlapping prompts return `409`; turns have
+a two-minute deadline. Idle conversations expire after 30 minutes. All conversations
+and context are lost on app restart; there is no disk persistence or automatic retry.
+A failed CLI session requires a new conversation. Tools and MCP remain disabled, so
+Claude cannot read or change workspace files. Per-user sandboxes are needed before
+enabling file and command tools for web requests.
+
+Run exactly one app worker/replica per sandbox: the session manager is process-local
+and startup cleans up earlier chat process groups. Configure `CHAT_MAX_SESSIONS`
+(default `4`) and `CHAT_IDLE_SECONDS` (default `1800`) in the app environment. Each
+conversation accepts up to 2 MiB of cumulative prompt/response text. SSE clients replay
+up to 2048 recent events; clients behind that window reload the transcript snapshot.
+These limits also bound sessions without active CLI processes.
 
 Alembic revision `0002` assigns an internal `user_id` to existing web users, retains each unique `google_sub`, and updates existing sessions to reference the new key. Run `uv run --env-file .env alembic upgrade head` before starting the updated app locally. The deployment script runs migrations automatically on EC2.
 
@@ -38,7 +53,7 @@ For local Compose, create `deploy/local-db-password.txt` (ignored by Git), put t
 ./deploy/local.sh
 ```
 
-The script builds the app and sandbox, discovers Docker socket permissions, runs database migrations, and waits for readiness. Run it again after source changes to rebuild the containers. At `http://localhost:8000`, sign in and use the **Ask the assistant** card. Each request runs Claude in the local sandbox and returns its answer; tools and conversation persistence remain disabled.
+The script builds the app and sandbox, discovers Docker socket permissions, runs database migrations, and waits for readiness. Run it again after source changes to rebuild the containers. At `http://localhost:8000`, sign in and use the **Ask the assistant** card. Claude stays running across turns and streams responses into the chat transcript; tools and disk persistence remain disabled.
 
 The app listens on `127.0.0.1:8000` and PostgreSQL on `127.0.0.1:5432`. The sandbox publishes no ports and has no workspace mount. Local exports under `data/` do not enter the containers. The app mounts the Docker socket to execute commands in the sandbox, matching production; this grants control of the local Docker daemon.
 
@@ -145,3 +160,16 @@ terraform -chdir=terraform/main validate
 bash -n deploy/remote.sh && bash -n deploy/deploy.sh
 docker buildx build --platform linux/arm64 -f src/assistant_agent/sandbox_kit/Dockerfile src/assistant_agent/sandbox_kit
 ```
+
+### Live chat integration check
+
+With the existing sandbox running and authenticated, run the opt-in two-turn test:
+
+```bash
+CHAT_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_chat.py -k real_claude
+```
+
+This makes real model requests. Normal tests use a fake Claude process and do not
+require Docker or provider credentials. Production SSE/proxy behavior must also be
+checked after deploying: confirm incremental text, reload/reconnect, and safe plain-text
+rendering.
