@@ -12,12 +12,15 @@ create, configure, or destroy containers -- the sandbox's lifecycle belongs to C
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 from dataclasses import dataclass
+from enum import Enum
 
-# Imported lazily inside _client() so that importing this module -- which the web app does
-# at startup -- never fails on a machine with no Docker socket.
+import aiodocker
+from aiohttp import ClientTimeout
+from aiodocker.execs import Exec
 
 DEFAULT_CONTAINER = "assistant-agent-sandbox-1"
 # The sandbox's WORKDIR, where the host's per-sandbox directory is bind-mounted.
@@ -27,6 +30,13 @@ REQUEST_TIMEOUT_SECONDS = 120
 
 class SandboxError(RuntimeError):
     """Raised when the sandbox is unreachable or not running."""
+
+
+class DockerClientRole(Enum):
+    # Short commands for health, readiness, process termination, and orphan cleanup.
+    CONTROL = "control"
+    # Long-lived conversation exec streams with stdin kept open across turns.
+    CHAT = "chat"
 
 
 @dataclass(frozen=True)
@@ -46,79 +56,147 @@ def container_name() -> str:
     return os.getenv("SANDBOX_CONTAINER", "").strip() or DEFAULT_CONTAINER
 
 
-def _client():
-    try:
-        import docker
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise SandboxError("The docker package is not installed.") from exc
-    try:
-        # A model request may run longer than the SDK's 60-second socket default.
-        return docker.from_env(timeout=REQUEST_TIMEOUT_SECONDS + 15)
-    except Exception as exc:
-        raise SandboxError(f"Cannot reach the Docker daemon: {exc}") from exc
+class Sandbox:
+    """Loop-owned Docker connections, separate for control and chat attachments."""
+
+    def __init__(self) -> None:
+        self._clients: dict[DockerClientRole, aiodocker.Docker] = {}
+        self.closed = False
+
+    def _client(self, role: DockerClientRole) -> aiodocker.Docker:
+        if self.closed:
+            raise SandboxError("Sandbox service is closed.")
+        if role not in self._clients:
+            try:
+                self._clients[role] = aiodocker.Docker(
+                    timeout=ClientTimeout(total=REQUEST_TIMEOUT_SECONDS + 15, connect=10)
+                )
+            except Exception as exc:
+                raise SandboxError(f"Cannot reach the Docker daemon: {exc}") from exc
+        return self._clients[role]
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        stdin: bool = False,
+        workdir: str = WORKSPACE,
+        name: str | None = None,
+    ) -> Exec:
+        target = name or container_name()
+        role = DockerClientRole.CHAT if stdin else DockerClientRole.CONTROL
+        try:
+            container = await self._client(role).containers.get(target)
+        except Exception as exc:
+            raise SandboxError(f"Sandbox container {target!r} not found: {exc}") from exc
+        status = container["State"]["Status"]
+        if status != "running":
+            raise SandboxError(f"Sandbox container {target!r} is {status}, not running.")
+        try:
+            return await container.exec(
+                ["bash", "-lc", command],
+                stdin=stdin,
+                stdout=True,
+                stderr=True,
+                tty=False,
+                user="agent",
+                workdir=workdir,
+            )
+        except Exception as exc:
+            raise SandboxError(f"Sandbox exec failed: {exc}") from exc
+
+    async def run(
+        self,
+        command: str,
+        *,
+        workdir: str = WORKSPACE,
+        name: str | None = None,
+        timeout: float = REQUEST_TIMEOUT_SECONDS + 15,
+    ) -> ExecResult:
+        """Use a login shell so the image's CLI PATH is available."""
+        try:
+            async with asyncio.timeout(timeout):
+                execution = await self.exec(command, workdir=workdir, name=name)
+                chunks = []
+                stream = execution.start()
+                try:
+                    await stream.__aenter__()
+                    while (message := await stream.read_out()) is not None:
+                        if message.stream not in (1, 2):
+                            raise SandboxError("Invalid Docker stream ID")
+                        chunks.append(message.data)
+                finally:
+                    await stream.close()
+                status = await execution.inspect()
+                code = status.get("ExitCode")
+                if code is None or status.get("Running"):
+                    raise SandboxError("Sandbox exec has no exit status.")
+                return ExecResult(code, b"".join(chunks).decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise SandboxError(f"Sandbox exec failed: {exc}") from exc
+
+    async def close(self) -> None:
+        self.closed = True
+        clients, self._clients = list(self._clients.values()), {}
+        if clients:
+            results = await asyncio.gather(
+                *(client.close() for client in clients), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def __aenter__(self) -> Sandbox:
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
 
 
-def run(
-    command: str,
-    *,
-    workdir: str = WORKSPACE,
-    name: str | None = None,
-) -> ExecResult:
-    """Run `command` in the sandbox through a login shell and collect its output.
-
-    A login shell, not a bare exec: the image puts the agent CLIs on PATH through
-    /etc/profile.d/10-npm-global.sh, which only a login shell sources. Without `-l`,
-    `claude` is not found.
-    """
-    target = name or container_name()
-    client = _client()
-    try:
-        container = client.containers.get(target)
-    except Exception as exc:
-        raise SandboxError(f"Sandbox container {target!r} not found: {exc}") from exc
-
-    if container.status != "running":
-        raise SandboxError(f"Sandbox container {target!r} is {container.status}, not running.")
-
-    try:
-        result = container.exec_run(
-            ["bash", "-lc", command],
-            workdir=workdir,
-            # The image's own user. Running as root would break Claude Code, which refuses
-            # --dangerously-skip-permissions as root, and would leave root-owned files in the
-            # bind-mounted workspace.
-            user="agent",
-            demux=False,
-        )
-    except Exception as exc:
-        raise SandboxError(f"Sandbox exec failed: {exc}") from exc
-    output = result.output.decode("utf-8", errors="replace") if result.output else ""
-    return ExecResult(exit_code=result.exit_code, output=output)
+async def run(command: str, **kwargs) -> ExecResult:
+    """Execute with a temporary service; chat uses its lifespan-owned service."""
+    async with Sandbox() as service:
+        return await service.run(command, **kwargs)
 
 
-def run_argv(argv: list[str], **kwargs) -> ExecResult:
-    """`run` for an argument list, quoted so the login shell cannot reinterpret it."""
-    return run(shlex.join(argv), **kwargs)
+async def run_argv(argv: list[str], **kwargs) -> ExecResult:
+    """Quote arguments so the login shell cannot reinterpret them."""
+    return await run(shlex.join(argv), **kwargs)
 
 
-def ask(message: str) -> ExecResult:
+async def ask(message: str) -> ExecResult:
     """Send one message to Claude and collect its plain-text response.
 
     The shared sandbox has no per-user workspace isolation yet, so this mode gives
     Claude no tools and saves no transcript in the container.
     """
-    return run_argv([
-        "timeout", "--signal=TERM", "--kill-after=5s", f"{REQUEST_TIMEOUT_SECONDS}s",
-        "claude", "-p", "--output-format", "text", "--no-session-persistence",
-        "--restricted", "--tools", "", "--disallowedTools", "mcp__*", "--", message,
-    ])
+    return await run_argv(
+        [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            f"{REQUEST_TIMEOUT_SECONDS}s",
+            "claude",
+            "-p",
+            "--output-format",
+            "text",
+            "--no-session-persistence",
+            "--restricted",
+            "--tools",
+            "",
+            "--disallowedTools",
+            "mcp__*",
+            "--",
+            message,
+        ]
+    )
 
 
-def health() -> dict:
+async def health() -> dict:
     """A small status dict for diagnostics: is the sandbox up and is the agent CLI there?"""
     target = container_name()
     try:
-        result = run_argv(["claude", "--version"])
+        result = await run_argv(["claude", "--version"])
     except SandboxError as exc:
         return {"container": target, "ok": False, "error": str(exc)}
     return {

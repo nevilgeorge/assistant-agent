@@ -49,9 +49,7 @@ def test_entrypoint_is_executable_and_copied_verbatim() -> None:
 def test_dockerfile_still_copies_only_the_entrypoint_from_the_context() -> None:
     """If upstream adds a context COPY, the vendored file list above is incomplete."""
     lines = (SANDBOX_KIT_DIR / "Dockerfile").read_text(encoding="utf-8").splitlines()
-    context_copies = [
-        line for line in lines if line.startswith("COPY ") and "--from=" not in line
-    ]
+    context_copies = [line for line in lines if line.startswith("COPY ") and "--from=" not in line]
     assert len(context_copies) == 1
     assert "docker/entrypoint.sh" in context_copies[0]
 
@@ -67,11 +65,11 @@ def test_container_name_defaults_and_honours_the_environment(monkeypatch) -> Non
     assert sandbox.container_name() == sandbox.DEFAULT_CONTAINER
 
 
-def test_run_reports_an_unreachable_daemon_as_sandbox_error(monkeypatch) -> None:
+async def test_run_reports_an_unreachable_daemon_as_sandbox_error(monkeypatch) -> None:
     """Importing the module must not require Docker; calling it must fail clearly."""
     monkeypatch.setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
     with pytest.raises(sandbox.SandboxError):
-        sandbox.run("true")
+        await sandbox.run("true")
 
 
 def test_exec_result_ok_tracks_the_exit_code() -> None:
@@ -79,29 +77,29 @@ def test_exec_result_ok_tracks_the_exit_code() -> None:
     assert not sandbox.ExecResult(1, "boom").ok
 
 
-def test_run_argv_quotes_its_arguments(monkeypatch) -> None:
+async def test_run_argv_quotes_its_arguments(monkeypatch) -> None:
     """Shell metacharacters in an argv entry must not reach the login shell unquoted."""
     seen: dict[str, str] = {}
 
-    def fake_run(command: str, **kwargs):
+    async def fake_run(command: str, **kwargs):
         seen["command"] = command
         return sandbox.ExecResult(0, "")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
-    sandbox.run_argv(["echo", "a b; rm -rf /"])
+    await sandbox.run_argv(["echo", "a b; rm -rf /"])
     assert seen["command"] == "echo 'a b; rm -rf /'"
 
 
-def test_ask_passes_message_as_one_argument_without_tools(monkeypatch) -> None:
+async def test_ask_passes_message_as_one_argument_without_tools(monkeypatch) -> None:
     seen = {}
 
-    def fake_run_argv(argv):
+    async def fake_run_argv(argv):
         seen["argv"] = argv
         return sandbox.ExecResult(0, "answer")
 
     monkeypatch.setattr(sandbox, "run_argv", fake_run_argv)
     prompt = "--help; $(touch /tmp/unwanted)"
-    assert sandbox.ask(prompt).output == "answer"
+    assert (await sandbox.ask(prompt)).output == "answer"
     assert seen["argv"][-1] == prompt
     # Claude's variadic tool flags must not consume the prompt, even if it starts '-'.
     assert seen["argv"][-2] == "--"

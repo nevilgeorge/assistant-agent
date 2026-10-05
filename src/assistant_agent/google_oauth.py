@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from typing import Any
+
+from google.auth.transport import Response
 
 import requests
 from google.auth.transport import requests as google_requests
@@ -13,6 +17,34 @@ from google_auth_oauthlib.flow import Flow
 from assistant_agent.config import REVOKE_URI, SCOPES, client_config, get_settings
 
 logger = logging.getLogger(__name__)
+GOOGLE_TIMEOUT_SECONDS = 10
+
+
+class TimedGoogleRequest(google_requests.Request):
+    """Bound requests made indirectly by verification and credential refresh."""
+
+    def __call__(
+        self,
+        url: str,
+        method: str = "GET",
+        body: bytes | str | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Response:
+        return super().__call__(
+            url,
+            method=method,
+            body=body,
+            headers=headers,
+            timeout=GOOGLE_TIMEOUT_SECONDS,
+            **kwargs,
+        )
+
+
+def refresh_credentials(creds: Credentials) -> None:
+    with requests.Session() as session:
+        creds.refresh(TimedGoogleRequest(session=session))
 
 
 def build_flow(state: str | None = None, code_verifier: str | None = None) -> Flow:
@@ -50,11 +82,14 @@ def authorization_url(*, nonce: str | None = None) -> tuple[str, str, str | None
     return url, state, flow.code_verifier
 
 
-def exchange_code(
-    authorization_response_url: str, state: str, code_verifier: str
-) -> Credentials:
+def exchange_code(authorization_response_url: str, state: str, code_verifier: str) -> Credentials:
     flow = build_flow(state=state, code_verifier=code_verifier)
-    flow.fetch_token(authorization_response=authorization_response_url)
+    try:
+        flow.fetch_token(
+            authorization_response=authorization_response_url, timeout=GOOGLE_TIMEOUT_SECONDS
+        )
+    finally:
+        flow.oauth2session.close()
     return flow.credentials
 
 
@@ -65,12 +100,13 @@ def account_identity(creds: Credentials, *, expected_nonce: str | None = None) -
     already in hand, and verifying it confirms the token was minted for *our*
     client. `sub` is the stable identifier -- emails can change.
     """
-    claims = id_token.verify_oauth2_token(
-        creds.id_token,
-        google_requests.Request(),
-        get_settings().google_client_id,
-        clock_skew_in_seconds=10,
-    )
+    with requests.Session() as session:
+        claims = id_token.verify_oauth2_token(
+            creds.id_token,
+            TimedGoogleRequest(session=session),
+            get_settings().google_client_id,
+            clock_skew_in_seconds=10,
+        )
     if expected_nonce is None or claims.get("nonce") != expected_nonce:
         raise ValueError("ID token nonce mismatch")
     if claims.get("email_verified") not in (True, "true") or not claims.get("sub"):

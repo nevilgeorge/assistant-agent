@@ -16,16 +16,16 @@ The browser uses plain text rendering and the **New conversation** button to res
 Turns continue if the browser disconnects. Overlapping prompts return `409`; turns have
 a two-minute deadline. Idle conversations expire after 30 minutes. All conversations
 and context are lost on app restart; there is no disk persistence or automatic retry.
-A failed CLI session requires a new conversation. Tools and MCP remain disabled, so
+A failed CLI conversation requires a new conversation. Tools and MCP remain disabled, so
 Claude cannot read or change workspace files. Per-user sandboxes are needed before
 enabling file and command tools for web requests.
 
-Run exactly one app worker/replica per sandbox: the session manager is process-local
+Run exactly one app worker/replica per sandbox: the conversation manager is process-local
 and startup cleans up earlier chat process groups. Configure `CHAT_MAX_SESSIONS`
 (default `4`) and `CHAT_IDLE_SECONDS` (default `1800`) in the app environment. Each
 conversation accepts up to 2 MiB of cumulative prompt/response text. SSE clients replay
 up to 2048 recent events; clients behind that window reload the transcript snapshot.
-These limits also bound sessions without active CLI processes.
+These limits also bound conversations without active CLI processes.
 
 Alembic revision `0002` assigns an internal `user_id` to existing web users, retains each unique `google_sub`, and updates existing sessions to reference the new key. Run `uv run --env-file .env alembic upgrade head` before starting the updated app locally. The deployment script runs migrations automatically on EC2.
 
@@ -189,7 +189,51 @@ bash -n deploy/remote.sh && bash -n deploy/deploy.sh
 docker buildx build --platform linux/arm64 -f src/assistant_agent/sandbox_kit/Dockerfile src/assistant_agent/sandbox_kit
 ```
 
+### Async web runtime
+
+FastAPI routes await SQLAlchemy database operations. The app creates its engine and
+store during lifespan startup and disposes the engine during shutdown, including
+failed startup. `create_app()` provides a fresh app for tests; the deployment entry
+point remains `assistant_agent.web:app`.
+
+Keep `DATABASE_URL=postgresql+psycopg://...` for both the web app and synchronous
+Alembic migrations. The web engine selects psycopg's async dialect. There is no
+schema migration for this change. Web tests use `sqlite+aiosqlite://`; synchronous
+migration tests continue to use `sqlite://`.
+
+Google SDK network calls run in bounded AnyIO workers (four concurrent calls), with
+10-second network timeouts. Database sessions are closed before waiting for Google
+or chat operations. Credential refresh updates existing users only, so a late
+refresh cannot recreate a disconnected account. Chat conversations and Docker exec use
+asyncio and aiodocker on the app event loop. The lifespan owns separate Docker
+clients for control commands and interactive attachments, and joins chat work
+before closing them. Run one app worker per sandbox. The CLI exporter remains
+synchronous.
+
+Run the optional PostgreSQL check against a development database:
+
+```bash
+ASYNC_TEST_DATABASE_URL='postgresql+psycopg://user:password@localhost:5432/database' uv run pytest -q tests/test_web_auth.py -k postgres_async
+```
+
+The check creates and drops a temporary schema and does not modify application
+tables. It verifies the async driver, transaction rollback, concurrent queries,
+and pool disposal. Normal tests also cover event-loop progress during slow I/O,
+transaction cancellation, SSE authentication expiry, and lifespan cleanup failures.
+
 ### Live chat integration check
+
+With the Compose sandbox running, verify the Docker transport without model credentials:
+
+```bash
+SANDBOX_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_sandbox_async.py
+```
+
+This checks repeated writes on one exec, separate stdout/stderr, exit codes,
+conversation reuse, and process group termination including descendants. The
+application uses aiodocker's public stream API; its protocol and transcript limits
+remain 2 MiB. Docker frame allocation belongs to aiodocker, which does not impose
+the old application's 16 MiB frame header limit.
 
 With the existing sandbox running and authenticated, run the opt-in two-turn test:
 

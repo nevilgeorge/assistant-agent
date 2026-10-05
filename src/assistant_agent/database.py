@@ -1,4 +1,5 @@
 """Database models for the public web application (separate from local CLI files)."""
+
 from __future__ import annotations
 
 import os
@@ -12,6 +13,12 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+)
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -33,11 +40,17 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("google_sub", name="uq_users_google_sub"),)
-    user_id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(
+        String(32), primary_key=True, default=lambda: uuid.uuid4().hex
+    )
     google_sub: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False)
-    connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    connected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
     credentials: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     scopes: Mapped[str] = mapped_column(String(2048), nullable=False)
     sessions: Mapped[list[WebSession]] = relationship(back_populates="user")
@@ -46,8 +59,12 @@ class User(Base):
 class WebSession(Base):
     __tablename__ = "web_sessions"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
-    session_token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
-    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True)
+    session_token_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True
+    )
     csrf_token: Mapped[str] = mapped_column(String(64), nullable=False)
     oauth_state: Mapped[str | None] = mapped_column(String(255))
     oauth_nonce: Mapped[str | None] = mapped_column(String(255))
@@ -63,3 +80,12 @@ def make_engine(url: str | None = None):
 
 def make_session_factory(url: str | None = None):
     return sessionmaker(make_engine(url), expire_on_commit=False)
+
+
+def make_async_engine(url: str | None = None) -> AsyncEngine:
+    """Use psycopg's async dialect in production and aiosqlite in tests."""
+    return create_async_engine(url or os.environ["DATABASE_URL"], pool_pre_ping=True)
+
+
+def make_async_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine, expire_on_commit=False)

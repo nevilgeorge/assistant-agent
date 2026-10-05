@@ -134,6 +134,12 @@ def _install_kit(args: argparse.Namespace) -> int:
 
 
 def _sandbox(args: argparse.Namespace) -> int:
+    import asyncio
+
+    return asyncio.run(_sandbox_async(args))
+
+
+async def _sandbox_async(args: argparse.Namespace) -> int:
     """Run a command in the sandbox container, or report its status."""
     import json
 
@@ -141,10 +147,10 @@ def _sandbox(args: argparse.Namespace) -> int:
 
     try:
         if not args.command:
-            status = health()
+            status = await health()
             print(json.dumps(status, indent=2))
             return 0 if status["ok"] else 1
-        result = run(" ".join(args.command))
+        result = await run(" ".join(args.command))
     except SandboxError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
