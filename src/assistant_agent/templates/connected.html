@@ -68,6 +68,7 @@
   <div id="message-response" class="chat-transcript" role="region" aria-label="Conversation messages" tabindex="0">
     <div class="chat-empty"><strong>What would you like to discuss?</strong><p>Send a message to start your conversation.</p></div>
   </div>
+  <p id="gmail-unavailable" class="lede gmail-notice" role="status" aria-live="polite" hidden>Gmail is unavailable in this conversation. Reset to retry.</p>
   <p id="message-status" class="lede chat-status" role="status" aria-live="polite"></p>
   <form id="message-form" class="chat-composer" data-csrf-token="{{ csrf_token }}">
     <label for="message-input">Message</label>
@@ -83,6 +84,7 @@
 const markdown = window.markdownit({html: false, breaks: true, linkify: true});
 const form = document.getElementById("message-form");
 const status = document.getElementById("message-status");
+const gmailUnavailable = document.getElementById("gmail-unavailable");
 const transcript = document.getElementById("message-response");
 const send = form.querySelector("button[type=submit]");
 const reset = document.getElementById("reset-chat");
@@ -94,6 +96,7 @@ function renderMessage(content, text) {
 }
 let source, conversationId, active = false, failed = false, loading = true, submitting = false;
 function controls() { send.disabled = loading || submitting || active || failed; }
+function gmailAvailability(value) { gmailUnavailable.hidden = value !== "unavailable"; }
 function nearBottom() { return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80; }
 function followMessages(follow) { if (follow) transcript.scrollTop = transcript.scrollHeight; }
 function emptyState() {
@@ -143,6 +146,7 @@ async function load(notice = "") {
     sessionStorage.setItem("chat-conversation", conversationId);
     transcript.replaceChildren(); rows.clear();
     active = Boolean(snapshot.active_turn); failed = snapshot.failed;
+    gmailAvailability(snapshot.gmail_status);
     for (const m of snapshot.transcript) row(m.role, m.text, m.turn_id, m.turn_id === snapshot.active_turn);
     if (!snapshot.transcript.length) emptyState();
     followMessages(true);
@@ -151,7 +155,9 @@ async function load(notice = "") {
     source.onmessage = event => {
       const data = JSON.parse(event.data);
       if (data.type === "reload" || data.type === "conversation_reset") { source.close(); load(data.message); return; }
-      if (data.type === "turn_start") {
+      if (data.type === "gmail_status") {
+        gmailAvailability(data.gmail_status);
+      } else if (data.type === "turn_start") {
         active = true; row("user", data.text, data.turn_id); row("assistant", "", data.turn_id);
         status.textContent = "Assistant is responding…";
       } else if (data.type === "assistant_delta") {

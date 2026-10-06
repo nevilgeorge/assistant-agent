@@ -158,7 +158,7 @@ ENV PATH=/home/agent/.npm-global/bin:$PATH
 # environment -- but it keeps the container's filesystem tidy and predictable.
 ENV CLAUDE_CONFIG_DIR=/home/agent/.claude
 
-# The agent CLIs are pinned at build time and the container is stateless, so
+# The agent CLIs are installed at build time and the container is stateless, so
 # telemetry, error reporting and self-update checks are just noise here. Set
 # before the install so the build-time version checks below inherit them.
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
@@ -168,9 +168,9 @@ ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 
 # Declared here rather than at the top of the file: an ARG in scope is recorded
 # on every RUN beneath it, which is why these two used to show up on the 467MB
-# apt layer in `docker history`. Bump them to move the agent CLIs.
-ARG CLAUDE_VERSION=2.1.282
-ARG CODEX_VERSION=0.156.1
+# apt layer in `docker history`. Uncached rebuilds resolve the latest releases.
+ARG CLAUDE_VERSION=latest
+ARG CODEX_VERSION=latest
 
 # Installed as `agent`, not root: Claude Code self-updates in place and needs
 # write access to its own install directory. The cache mount must be owned by

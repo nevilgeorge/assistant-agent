@@ -14,7 +14,7 @@ from assistant_agent import sandbox
 
 from . import constants
 from .chat_error import ChatError
-from .claude_process import ClaudeProcess
+from .claude_process import ClaudeProcess, GmailUnavailable
 from .conversation import Conversation
 
 if TYPE_CHECKING:
@@ -82,13 +82,13 @@ class ConversationManager:
     def resolve_live_assignment(
         self, user_id: str, conversation_id: str, container_id: str,
     ) -> sandbox.SandboxHandle | None:
-        """Resolve only an existing, ready assignment using trusted grant identities."""
+        """Resolve a granted live assignment independently of Claude readiness."""
         conversation = self.conversations.get(user_id)
         if (
             self.stopped or conversation is None or conversation.conversation_id != conversation_id
-            or conversation.is_starting or conversation.has_failed or conversation.is_retired
-            or conversation.access_expired() or conversation.claude_process is None
-            or conversation.claude_process.is_closed
+            or conversation.has_failed or conversation.is_retired
+            or conversation.access_token_id is None or conversation.access_token_expires_at is None
+            or conversation.access_expired()
         ):
             return None
         sandbox_handle = conversation.sandbox_handle
@@ -209,6 +209,7 @@ class ConversationManager:
         """Start a reserved conversation process and close it if already retired."""
         process = None
         begun = False
+        startup_failure = None
         try:
             try:
                 async with self.cleanup_lock:
@@ -221,25 +222,96 @@ class ConversationManager:
                 )
                 if conversation.is_retired or self.stopped:
                     raise ChatError("The assistant conversation ended. Start a new conversation.", 503)
+                raw_token = None
                 if self.access_service is not None:
                     issued_access = await self.access_service.issue(
-                        conversation.user_id, conversation.conversation_id, conversation.sandbox_handle.container_id,
+                        conversation.user_id, conversation.conversation_id,
+                        conversation.sandbox_handle.container_id,
                     )
                     conversation.access_token_id = issued_access.token_id
                     conversation.access_token_expires_at = issued_access.expires_at
+                    raw_token = issued_access.raw_token
                     del issued_access
-                if conversation.is_retired or self.stopped or conversation.access_expired():
-                    raise ChatError("The assistant conversation ended. Start a new conversation.", 503)
-                async with asyncio.timeout(constants.STARTUP_SECONDS):
-                    process_options = (
-                        {"before_close": conversation.revoke_access}
-                        if self.access_service is not None or self.session_files_service is not None else {}
-                    )
-                    process = await self.process_factory.create(
-                        conversation.conversation_id, conversation.receive, conversation.fail, self.sandbox_service,
-                        conversation.sandbox_handle, **process_options,
-                    )
+                # Allocation has its own deadline; this budget starts after grant issuance.
+                async with asyncio.timeout(constants.GMAIL_STARTUP_SECONDS):
+                    selected = False
+                    startup_failure = None
+
+                    def process_failed(message: str) -> None:
+                        """Keep provisional failures out of conversation turn handling."""
+                        nonlocal startup_failure
+                        if selected:
+                            conversation.fail(message)
+                        else:
+                            startup_failure = message
+
+                    def check_assignment() -> None:
+                        """Prevent reset, expiry, or shutdown from selecting a process."""
+                        if (conversation.is_retired or self.stopped
+                                or conversation.access_expired() or startup_failure):
+                            raise ChatError(
+                                "The assistant conversation ended. Start a new conversation.", 503
+                            )
+
+                    async def launch(gmail_enabled: bool) -> ClaudeProcess:
+                        """Bound each launch independently of the overall startup budget."""
+                        async with asyncio.timeout(constants.STARTUP_SECONDS):
+                            return await self.process_factory.create(
+                                conversation.conversation_id, conversation.receive, process_failed,
+                                self.sandbox_service, conversation.sandbox_handle,
+                                before_close=conversation.revoke_access,
+                                mcp_token=raw_token if gmail_enabled else None,
+                                gmail_enabled=gmail_enabled,
+                            )
+
+                    try:
+                        check_assignment()
+                        if raw_token is not None:
+                            try:
+                                await self.sandbox_service.provision_mcp(
+                                    conversation.sandbox_handle, gmail_enabled=True,
+                                )
+                            except Exception:
+                                raise GmailUnavailable("configuration") from None
+                            check_assignment()
+                            process = await launch(True)
+                            # Drop app-side bearer references as soon as exec launch returns.
+                            raw_token = None
+                            await process.discover_gmail()
+                            check_assignment()
+                            conversation.set_gmail_status("ready")
+                        else:
+                            await self.sandbox_service.provision_mcp(
+                                conversation.sandbox_handle, gmail_enabled=False,
+                            )
+                            process = await launch(False)
+                            check_assignment()
+                            conversation.set_gmail_status("unavailable")
+                    except GmailUnavailable:
+                        raw_token = None
+                        check_assignment()
+                        logger.warning("Gmail startup unavailable; selecting chat-only conversation")
+                        # A failed termination or retirement drain must abort startup.
+                        if process is not None:
+                            await process.close()
+                            process = None
+                        await conversation.revoke_access()
+                        check_assignment()
+                        await self.sandbox_service.provision_mcp(
+                            conversation.sandbox_handle, gmail_enabled=False,
+                        )
+                        process = await launch(False)
+                        check_assignment()
+                        conversation.set_gmail_status("unavailable")
+                    finally:
+                        raw_token = None
+                    selected = True
             except Exception:
+                if startup_failure:
+                    conversation.fail(startup_failure)
+                    raise ChatError(
+                        "The assistant conversation ended. Start a new conversation.", 503
+                    ) from None
                 conversation.has_failed = True
                 raise ChatError(
                     "The assistant is unavailable. Start a new conversation.", 503

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ class FakeSandbox:
         self.reconcile = AsyncMock()
         self.retry_cleanup = AsyncMock()
         self.close = AsyncMock()
+        self.provision_mcp = AsyncMock()
 
     async def allocate(self, user_id, conversation_id):
         handle = sandbox.SandboxHandle(
@@ -48,6 +50,9 @@ class FakeProcess:
         self.prompts = []
         self.is_closed = False
 
+    async def discover_gmail(self):
+        pass
+
     async def send(self, prompt):
         self.prompts.append(prompt)
 
@@ -55,7 +60,7 @@ class FakeProcess:
         self.is_closed = True
 
     @classmethod
-    async def create(cls, token, receive, failed, service, handle, *, before_close=None):
+    async def create(cls, token, receive, failed, service, handle, *, before_close=None, mcp_token=None, gmail_enabled=False):
         process = cls(token, receive, failed)
         process.sandbox_handle = handle
         return process
@@ -167,7 +172,7 @@ class Gate:
         self.release = asyncio.Event()
         self.made = []
 
-    async def create(self, token, receive, failed, service, handle, *, before_close=None):
+    async def create(self, token, receive, failed, service, handle, *, before_close=None, mcp_token=None, gmail_enabled=False):
         self.entered.set()
         await self.release.wait()
         self.made.append(FakeProcess(token, receive, failed))
@@ -250,7 +255,7 @@ async def test_transport_failure_during_spawn(manager):
 
     class Factory:
         @staticmethod
-        async def create(token, receive, failed, service, handle):
+        async def create(token, receive, failed, service, handle, **kwargs):
             made.append(FakeProcess(token, receive, failed))
             failed("Ended")
             return made[-1]
@@ -283,9 +288,9 @@ async def test_cleanup_runs_once_before_any_spawn(manager, monkeypatch):
 
     class Factory(FakeProcess):
         @classmethod
-        async def create(cls, *args):
+        async def create(cls, *args, **kwargs):
             order.append("spawn")
-            return await super().create(*args)
+            return await super().create(*args, **kwargs)
 
     manager.sandbox_service.reconcile = cleanup
     manager.process_factory = Factory
@@ -352,7 +357,8 @@ async def transport(monkeypatch):
     received, failures = [], []
     process = await chat.ClaudeProcess.create("test", received.append, failures.append, service, fake_handle())
     yield process, stream, service, received, failures
-    await process.close()
+    if process.teardown_task is None or not process.teardown_task.done():
+        await process.close()
     assert process.output_reader_task.done() and stream.closed == 1
 
 
@@ -509,7 +515,8 @@ async def test_teardown_deadline_still_closes_stream(transport, monkeypatch):
         await asyncio.Future()
 
     service.run = blocked
-    await process.close()
+    with pytest.raises(sandbox.SandboxError, match="termination"):
+        await process.close()
     assert stream.closed == 1 and process.output_reader_task.done()
 
 
@@ -606,7 +613,9 @@ async def test_exec_credentials_are_only_process_environment(transport):
     process, stream, service, received, failures = transport
     call = service.exec.call_args
     assert call.kwargs["name"] == "test-container"
-    assert call.kwargs["environment"] == {"ANTHROPIC_API_KEY": "secret-api-key"}
+    assert call.kwargs["environment"] == {
+        "ANTHROPIC_API_KEY": "secret-api-key", "MCP_TIMEOUT": "10000",
+    }
     assert "ANTHROPIC_API_KEY" not in call.args[0]
     assert "secret-api-key" not in call.args[0]
     assert all(call.kwargs["name"] == "test-container" for call in service.run.call_args_list)
@@ -648,12 +657,14 @@ async def test_access_issue_before_process_start_and_fixed_between_turns(access_
     class InspectingFactory(FakeProcess):
         @classmethod
         async def create(
-            cls, conversation_id, receive, failed, service, handle, *, before_close=None,
+            cls, conversation_id, receive, failed, service, handle, *, before_close=None, mcp_token=None, gmail_enabled=False,
         ):
             observed.append(access_service.issued[-1])
+            conversation = conversation_manager.get(handle.user_id)
+            assert conversation.is_starting and conversation.claude_process is None
             assert conversation_manager.resolve_live_assignment(
                 handle.user_id, handle.conversation_id, handle.container_id,
-            ) is None
+            ) is handle
             return await super().create(
                 conversation_id, receive, failed, service, handle, before_close=before_close,
             )
@@ -664,6 +675,9 @@ async def test_access_issue_before_process_start_and_fixed_between_turns(access_
     deadline = conversation.access_token_expires_at
     assert observed == [("alice", conversation.conversation_id, conversation.sandbox_handle.container_id)]
     assert conversation.access_token_id == "grant-id"
+    assert conversation.snapshot()["gmail_status"] == "ready"
+    assert any(event["type"] == "gmail_status" and event["gmail_status"] == "ready"
+               for event in conversation.replay_events)
     conversation.claude_process.finish()
     assert conversation_manager.resolve_live_assignment(
         "alice", conversation.conversation_id, conversation.sandbox_handle.container_id,
@@ -686,15 +700,93 @@ async def test_live_assignment_lookup_denies_wrong_or_inactive_identity(access_m
     assert resolver("bob", conversation.conversation_id, container_id) is None
     assert resolver("alice", "different", container_id) is None
     assert resolver("alice", conversation.conversation_id, "different") is None
-    for field in ("is_starting", "has_failed", "is_retired"):
+    for field in ("has_failed", "is_retired"):
         setattr(conversation, field, True)
         assert resolver("alice", conversation.conversation_id, container_id) is None
         setattr(conversation, field, False)
-    conversation.claude_process.is_closed = True
+    for field in ("sandbox_handle", "access_token_id", "access_token_expires_at"):
+        original_value = getattr(conversation, field)
+        setattr(conversation, field, None)
+        assert resolver("alice", conversation.conversation_id, container_id) is None
+        setattr(conversation, field, original_value)
+    sandbox_handle = conversation.sandbox_handle
+    for field in ("user_id", "conversation_id", "container_id"):
+        conversation.sandbox_handle = replace(sandbox_handle, **{field: "different"})
+        assert resolver("alice", conversation.conversation_id, container_id) is None
+    conversation.sandbox_handle = sandbox_handle
+    conversation_manager.stopped = True
     assert resolver("alice", conversation.conversation_id, container_id) is None
-    conversation.claude_process.is_closed = False
+    conversation_manager.stopped = False
     conversation.access_token_expires_at = datetime.now(UTC)
     assert resolver("alice", conversation.conversation_id, container_id) is None
+
+
+@pytest.mark.parametrize("is_starting", [False, True])
+@pytest.mark.parametrize("process_state", ["missing", "closed"])
+async def test_live_assignment_authorization_independent_of_process_readiness(
+    access_manager, is_starting, process_state,
+):
+    conversation_manager, _ = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    process = conversation.claude_process
+    conversation.is_starting = is_starting
+    if process_state == "missing":
+        conversation.claude_process = None
+    else:
+        process.is_closed = True
+    try:
+        assert conversation_manager.resolve_live_assignment(
+            "alice", conversation.conversation_id, conversation.sandbox_handle.container_id,
+        ) is conversation.sandbox_handle
+    finally:
+        conversation.is_starting = False
+        conversation.claude_process = process
+        process.is_closed = False
+
+
+@pytest.mark.parametrize("revocation_fails", [False, True])
+async def test_revocation_immediately_denies_assignment_without_retirement(
+    access_manager, revocation_fails,
+):
+    conversation_manager, access_service = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    expiry = conversation.access_token_expires_at
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def revoke(conversation_id):
+        assert conversation_id == conversation.conversation_id
+        entered.set()
+        await release.wait()
+        if revocation_fails:
+            raise RuntimeError("database unavailable")
+        return True
+
+    async def retire_files(conversation_id):
+        assert conversation_id == conversation.conversation_id
+        assert conversation.access_token_id is None
+        assert conversation_manager.resolve_live_assignment(
+            "alice", conversation_id, conversation.sandbox_handle.container_id,
+        ) is None
+
+    access_service.revoke_conversation = revoke
+    conversation.session_files_service = SimpleNamespace(retire=AsyncMock(side_effect=retire_files))
+    revoking = asyncio.create_task(conversation.revoke_access())
+    await entered.wait()
+    try:
+        assert not conversation.has_failed and not conversation.is_retired
+        assert not conversation.claude_process.is_closed
+        assert conversation.access_token_id is None
+        assert conversation.access_token_expires_at == expiry
+        assert conversation_manager.resolve_live_assignment(
+            "alice", conversation.conversation_id, conversation.sandbox_handle.container_id,
+        ) is None
+    finally:
+        release.set()
+        await revoking
+    assert conversation.access_token_id is None
+    conversation.session_files_service.retire.assert_awaited_once_with(conversation.conversation_id)
 
 
 @pytest.mark.parametrize("retirement", ["reset", "failure", "timeout", "shutdown"])
@@ -817,6 +909,7 @@ async def test_retirement_during_token_issue_revokes_late_grant(access_manager, 
     original_issue = access_service.issue
 
     async def issue(*args):
+        assert conversation_manager.resolve_live_assignment(*args) is None
         entered.set()
         await release.wait()
         return await original_issue(*args)
@@ -1040,9 +1133,10 @@ async def test_real_process_cleanup_proceeds_when_revocation_hook_fails():
 
 
 @pytest.mark.parametrize("startup_failure", [False, True])
-async def test_manager_wires_revocation_into_real_process_cleanup(access_manager, startup_failure):
+async def test_manager_wires_revocation_into_real_process_cleanup(access_manager, startup_failure, monkeypatch):
     conversation_manager, access_service = access_manager
     conversation_manager.process_factory = chat.ClaudeProcess
+    monkeypatch.setattr(chat.ClaudeProcess, "discover_gmail", AsyncMock())
     stream = FakeStream()
     commands = []
     entered, release = asyncio.Event(), asyncio.Event()
@@ -1084,3 +1178,127 @@ async def test_manager_wires_revocation_into_real_process_cleanup(access_manager
     assert conversation.conversation_id in access_service.revoked
     assert stream.closed == 1
     assert any("kill -TERM" in command for command in commands)
+
+
+@pytest.mark.parametrize("configuration_failure", [False, True])
+async def test_gmail_fallback_once_preserves_chat_and_expiry(access_manager, configuration_failure):
+    from assistant_agent.chat.claude_process import GmailUnavailable
+
+    manager, access = access_manager
+    launches = []
+
+    class DiscoveryFactory(FakeProcess):
+        @classmethod
+        async def create(cls, *args, mcp_token=None, gmail_enabled=False, **kwargs):
+            process = await super().create(*args, **kwargs)
+            launches.append((gmail_enabled, mcp_token, process))
+            process.discover_gmail = AsyncMock(side_effect=GmailUnavailable("missing_tools"))
+            return process
+
+    manager.process_factory = DiscoveryFactory
+    manager.session_files_service = SimpleNamespace(retire=AsyncMock())
+    if configuration_failure:
+        manager.sandbox_service.provision_mcp.side_effect = [RuntimeError("config"), None]
+    conversation = manager.get("alice")
+    await manager.submit("alice", "first")
+    assert len(launches) == (1 if configuration_failure else 2)
+    assert launches[-1][:2] == (False, None)
+    if not configuration_failure:
+        assert launches[0][0] and launches[0][1] == "private-bearer-token"
+        assert launches[0][2].is_closed and launches[0][2].prompts == []
+    assert launches[-1][2].prompts == ["first"]
+    assert conversation.snapshot()["gmail_status"] == "unavailable"
+    assert [event["gmail_status"] for event in conversation.replay_events
+            if event["type"] == "gmail_status"] == ["unavailable"]
+    assert conversation.access_token_id is None and conversation.access_token_expires_at is not None
+    assert len(access.issued) == 1 and access.revoked
+    manager.session_files_service.retire.assert_awaited()
+    conversation.claude_process.finish()
+    await manager.submit("alice", "second")
+    assert conversation.claude_process.prompts == ["first", "second"]
+    assert conversation.snapshot()["gmail_status"] == "unavailable"
+    assert len(launches) == (1 if configuration_failure else 2)
+    assert "private-bearer-token" not in repr(vars(conversation))
+
+
+@pytest.mark.parametrize("failure", ["transport", "termination", "replacement"])
+async def test_gmail_startup_normal_failures_do_not_select_fallback(access_manager, failure):
+    from assistant_agent.chat.claude_process import GmailUnavailable
+
+    manager, _ = access_manager
+    launches = []
+
+    class FailureFactory(FakeProcess):
+        @classmethod
+        async def create(cls, *args, **kwargs):
+            launches.append(kwargs)
+            if not kwargs["gmail_enabled"]:
+                raise RuntimeError("replacement")
+            process = await super().create(*args, **kwargs)
+            error = RuntimeError("transport") if failure == "transport" else GmailUnavailable("missing")
+            process.discover_gmail = AsyncMock(side_effect=error)
+            if failure == "termination":
+                process.close = AsyncMock(side_effect=RuntimeError("termination"))
+            return process
+
+    manager.process_factory = FailureFactory
+    with pytest.raises(ChatError):
+        await manager.submit("alice", "first")
+    assert len(launches) == (2 if failure == "replacement" else 1)
+    assert manager.get("alice").has_failed
+    assert not manager.get("alice").transcript_messages
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+@pytest.mark.parametrize("retirement", ["reset", "shutdown", "expiry"])
+async def test_retirement_during_gmail_launch_attempt(access_manager, attempt, retirement):
+    from assistant_agent.chat.claude_process import GmailUnavailable
+
+    manager, _ = access_manager
+    entered, release = asyncio.Event(), asyncio.Event()
+    launches = []
+
+    class GateFactory(FakeProcess):
+        @classmethod
+        async def create(cls, *args, **kwargs):
+            process = await super().create(*args, **kwargs)
+            launches.append(process)
+            if len(launches) == attempt:
+                entered.set()
+                await release.wait()
+            process.discover_gmail = AsyncMock(side_effect=GmailUnavailable("missing"))
+            return process
+
+    manager.process_factory = GateFactory
+    submitting = asyncio.create_task(manager.submit("alice", "first"))
+    await entered.wait()
+    conversation = manager.get("alice")
+    if retirement == "reset":
+        await manager.reset("alice")
+    elif retirement == "expiry":
+        conversation.access_token_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await manager.sweep_once()
+    else:
+        closing = asyncio.create_task(manager.close())
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(ChatError):
+        await submitting
+    if retirement == "shutdown":
+        await closing
+    assert all(process.is_closed and not process.prompts for process in launches)
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+
+
+@pytest.mark.parametrize("deadline", ["STARTUP_SECONDS", "GMAIL_STARTUP_SECONDS"])
+async def test_gmail_startup_deadlines_do_not_send_prompt(access_manager, monkeypatch, deadline):
+    manager, access = access_manager
+    monkeypatch.setattr(constants, deadline, 0.01)
+    gate = Gate()
+    manager.process_factory = gate
+    with pytest.raises(ChatError):
+        await manager.submit("alice", "first")
+    assert access.revoked
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+    assert not manager.get("alice").transcript_messages

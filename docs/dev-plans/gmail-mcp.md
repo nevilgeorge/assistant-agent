@@ -1,6 +1,6 @@
 # Gmail MCP and session file access
 
-Status: Phases 1–4 implemented; Claude registration and integrated validation remain pending. Last updated: 2026-10-06.
+Status: Phases 1–5 implemented; installed-CLI validation is recorded below. Integrated live-account validation remains phase 6. Last updated: 2026-10-06.
 
 ## Decision and scope
 
@@ -86,7 +86,7 @@ Configure built-in local analysis separately from MCP:
 | `--permission-mode dontAsk` | Deny operations that would require a prompt, while allowing preapproved and normally permission-free operations. Do not use global permission bypass. |
 | Docker `/input:ro` | Enforce read-only input files at the OS level, including for shell subprocesses. |
 
-Bash patterns are permission checks, not filesystem isolation: `Bash(rg *)` permits arbitrary arguments, including preprocessor options that can run other programs, and file-tool rules do not constrain arbitrary scripts. Docker mounts, permissions, and container isolation remain the enforcement boundary. Broad Python approval would authorize arbitrary code inside that boundary and is a separate decision. Validate allowed reads/searches, denied writes, and noninteractive permission failures against the image's pinned CLI version.
+Bash patterns are permission checks, not filesystem isolation: `Bash(rg *)` permits arbitrary arguments, including preprocessor options that can run other programs, and file-tool rules do not constrain arbitrary scripts. Docker mounts, permissions, and container isolation remain the enforcement boundary. Broad Python approval would authorize arbitrary code inside that boundary and is a separate decision. Validate allowed reads/searches, denied writes, and noninteractive permission failures against the image's installed CLI version. CLI defaults use npm's `latest` releases; ordinary builds may reuse cached installations, while explicit uncached rebuilds refresh them. Record the installed versions during validation.
 
 Claude discovers tool descriptions and schemas from the endpoint automatically. No Gmail SDK, local MCP server, or shim is needed inside the sandbox.
 
@@ -106,7 +106,7 @@ Direct HTTP is the simplest supported transport. A reverse proxy on separate san
 
 ## Development Plan
 
-Use each phase below as the scope for a separate Codex implementation plan. Phases 1–4 are implemented; phases 5–6 are pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4. Keep agent tools disabled until phase 5.
+Use each phase below as the scope for a separate Codex implementation plan. Phases 1–5 are implemented; phase 6 is pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4.
 
 | Phase | Design sections |
 | --- | --- |
@@ -164,8 +164,11 @@ Cancellation stops queued Gmail requests and further preview scheduling, while a
 
 Implemented with Alembic revision `0004` and `SandboxAccessService`, shared through
 the web lifespan and a typed dependency. Grants have a fixed 24-hour expiry and
-resolve trusted identities and input paths from a ready live assignment. Each
-launch issues a grant after sandbox readiness; phase 3 discards the raw token.
+resolve trusted identities and input paths from an allocated live assignment
+with a recorded grant, independently of Claude process readiness. This permits
+authenticated MCP discovery during launch; it does not establish Gmail readiness.
+Revocation clears local grant eligibility before awaiting database or file cleanup.
+Each launch issues a grant after sandbox readiness; phase 3 discards the raw token.
 Retirement denies authorization synchronously, followed by database revocation
 before process and container cleanup. Failed revocations are retried by the
 sweeper. Restart invalidates outstanding grants even when Docker is unavailable;
@@ -240,7 +243,69 @@ Claude receives no bearer token or MCP configuration until phase 5.
 
 - Supply the MCP JSON, inject `ASSISTANT_MCP_TOKEN` into the assigned Claude exec environment, and configure explicit MCP registration/tool permissions plus local read/search access as documented.
 - Replace the blanket MCP denial, retain restricted mode, and use noninteractive permission handling. Surface discovery/authentication failures before reporting Gmail readiness; add brief guidance on search versus explicit download and the limits of local search.
-- **Complete when:** the pinned CLI discovers and calls the tools from its assigned container, reads downloads with `ls`/`rg`, rejects input writes, and handles unapproved operations without hanging for input. Verify Google credentials are absent from the sandbox. Broad Python approval remains a separate decision.
+- **Complete when:** the installed CLI discovers and calls the tools from its assigned container, reads downloads with `ls`/`rg`, rejects input writes, and handles unapproved operations without hanging for input. Verify Google credentials are absent from the sandbox. Broad Python approval remains a separate decision.
+
+Implemented registration uses Docker's archive API to provision root-owned
+`/run/assistant` (0755) and `mcp.json` (0644), with the literal environment-variable
+placeholder above. The agent cannot rewrite the file or its directory. The raw
+grant goes only into the Claude Docker exec environment; conversation state,
+configuration, launch arguments, snapshots, and logs do not retain it. The legacy
+`sandbox.ask()` helper continues to expose no tools.
+
+After stream attachment, the output reader starts before the PID readiness check.
+Serialized stdin writes carry request-ID-correlated `initialize` and `mcp_status`
+control requests. Successful initialization plus connected `gmail` status and all
+five exact tool names establish readiness. Claude 2.1.292 advertises bare names
+inside its named server status; these map to the exact prefixed permission names.
+Control responses remain inside `ClaudeProcess` and are never forwarded or logged.
+Readiness does not wait for `system/init` or require a model call or first prompt.
+
+Discovery has a 10-second deadline (`MCP_TIMEOUT=10000`) and polls status every
+250 ms. Each process launch has a 15-second limit. After grant issuance, the
+manager budgets 45 seconds for configuration, first launch, discovery, bounded
+cleanup, and any fallback; allocation retains its separate 30-second deadline.
+
+Configuration or Gmail discovery failures stop the provisional process, revoke
+the grant, and retire/drain downloads before one chat-only replacement launches
+in the same assigned container. That replacement has strict empty MCP config,
+blanket MCP denial, no Gmail token, and explicit unavailable guidance, while
+retaining documented local tools. It receives the first prompt once, only after
+the final process is selected, and supports subsequent turns. No new grant is
+issued because retirement tombstones the conversation ID. The original grant
+expiry still bounds conversation lifetime. Transport/protocol failures, grant
+issuance failures, failed termination, or fallback-launch failures follow normal
+conversation failure and resource cleanup.
+
+Snapshots expose `gmail_status` (`pending`, `ready`, `unavailable`). Resolution
+publishes a replayable `gmail_status` event. The UI preserves the separate notice
+“Gmail is unavailable in this conversation. Reset to retry.” across reloads and
+turn completion. Reset creates a new conversation and retries Gmail. Diagnostics
+record only safe failure categories and installed CLI versions. No new migration
+or deployment is required for phase 5.
+
+The opt-in installed-CLI test is `tests/test_claude_gmail_integration.py`; run
+`CLAUDE_GMAIL_INTEGRATION=1 .venv/bin/pytest -q -s tests/test_claude_gmail_integration.py`
+with an available `ANTHROPIC_API_KEY`. It uses real database grants, the actual
+HTTP MCP endpoint with synthetic Gmail data, disposable assigned Docker
+containers and network, and a relay for the documented `app:8000` address. It
+pins the existing built image ID for the run, without pulls or rebuilds, and
+makes billable model calls. It requires Docker host reachability via
+`host.docker.internal` (Docker Desktop/OrbStack). Live Google workflows,
+integrated two-user isolation, reachability review, performance measurement,
+and production rollout remain phase 6.
+
+Validation completed on 2026-10-06 against built image
+`sha256:893c76059e11bb7f7898110caf0f829113a429fa9a5f063b1e914d145ac84a1c`:
+Claude Code **2.1.292**, Codex CLI **0.160.1**. The real check passed in 23.62 seconds:
+authenticated discovery before any prompt, successful calls to all five tools,
+actual downloaded-file access through Read/`ls`/`rg`, two noninteractive denials
+for unapproved Bash writes, direct OS rejection of `/input` writes, root-owned
+configuration immutability to `agent`, and container configuration free of Google
+credentials, model credentials, and MCP grant. Three consecutive turns used the
+same Claude process. Phase 5 is complete. Regression verification: **345 passed,
+6 skipped**, with Ruff passing; opt-in real CLI validation is additional to that
+default suite. The synthetic check does not claim live-account or deployment
+validation.
 
 ### Phase 6 — End-to-end validation and rollout
 

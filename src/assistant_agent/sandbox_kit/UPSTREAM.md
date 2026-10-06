@@ -1,6 +1,8 @@
 # sandbox_kit provenance
 
-Vendored from `git@github.com:nevilgeorge/agent-sandbox.git` at **d572785**.
+Vendored from `git@github.com:nevilgeorge/agent-sandbox.git` at **d572785**, plus
+the local upstream change defaulting `CLAUDE_VERSION` and `CODEX_VERSION` to
+`latest`. The upstream change is not yet committed.
 
 These are **byte-identical copies**, not generated files. Unlike
 `src/assistant_agent/agent_kit/`, nothing installs them anywhere: `deploy/deploy.sh`

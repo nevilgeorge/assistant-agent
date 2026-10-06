@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from assistant_agent import sandbox
 
@@ -65,6 +65,14 @@ class Conversation:
         self.session_files_service: SessionFilesService | None = session_files_service
         self.access_token_id: str | None = None
         self.access_token_expires_at: datetime | None = None
+        self.gmail_status: Literal["pending", "ready", "unavailable"] = "pending"
+
+    def set_gmail_status(self, status: Literal["pending", "ready", "unavailable"]) -> None:
+        """Publish resolved Gmail availability for live clients and reconnects."""
+        if self.is_retired or self.has_failed or status == self.gmail_status:
+            return
+        self.gmail_status = status
+        self.emit("gmail_status", gmail_status=status)
 
     def access_expired(self) -> bool:
         """Check the fixed grant deadline without extending it between turns."""
@@ -74,7 +82,8 @@ class Conversation:
         )
 
     async def revoke_access(self) -> None:
-        """Revoke grants and drain file work before any assignment cleanup."""
+        """Deny assignment access, revoke grants, and drain file work before cleanup."""
+        self.access_token_id = None
         try:
             if self.sandbox_access_service is not None:
                 await self.sandbox_access_service.revoke_conversation(self.conversation_id)
@@ -100,6 +109,7 @@ class Conversation:
             sequence=self.event_sequence,
             active_turn=self.active_turn_id,
             failed=self.has_failed,
+            gmail_status=self.gmail_status,
         )
 
     def _fail(self, message: str) -> None:

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import io
+import json
+import tarfile
 import shlex
 import re
 import shutil
@@ -327,6 +330,39 @@ class Sandbox:
             return {"ok": True, "image": self.settings.image, "network": self.settings.network}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    async def provision_mcp(self, handle: SandboxHandle, gmail_enabled: bool) -> None:
+        """Publish root-owned, secret-free MCP configuration through Docker archive."""
+        config = {"mcpServers": {}}
+        if gmail_enabled:
+            config["mcpServers"]["gmail"] = {
+                "type": "http",
+                "url": "http://app:8000/mcp/gmail",
+                "headers": {"Authorization": "Bearer ${ASSISTANT_MCP_TOKEN}"},
+            }
+        config_bytes = json.dumps(config).encode("utf-8")
+        # Write json config to a tar archive and upload it into the container.
+        archive_buffer = io.BytesIO()
+        with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
+            # Create a directory named "assistant"
+            directory = tarfile.TarInfo("assistant")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.uid = directory.gid = 0
+            archive.addfile(directory)
+            # Create a file named "mcp.json"
+            config_file = tarfile.TarInfo("assistant/mcp.json")
+            config_file.mode = 0o644
+            config_file.uid = config_file.gid = 0
+            config_file.size = len(config_bytes)
+            archive.addfile(config_file, io.BytesIO(config_bytes))
+        try:
+            container = await self._client(DockerClientRole.CONTROL).containers.get(
+                handle.container_id
+            )
+            await container.put_archive("/run", archive_buffer.getvalue())
+        except Exception as exc:
+            raise SandboxError("MCP configuration provisioning failed.") from exc
 
     async def exec(
         self,
