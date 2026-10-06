@@ -33,6 +33,22 @@ Alembic revision `0002` assigns an internal `user_id` to existing web users, ret
 
 Revision `0003` adds a UUID `id` primary key to web sessions and renames `id_hash` to `session_token_hash`, with a unique index for token lookups. Existing sessions remain valid after migration.
 
+Revision `0004` adds hash-only sandbox access grants bound to a user, conversation,
+and container. Apply it before starting the updated app with
+`uv run --env-file .env alembic upgrade head`. Grants expire 24 hours after issuance;
+later turns do not renew them. Reset, failure, expiry, disconnect, and shutdown
+retire the assignment and revoke its grants before cleanup. Browser sessions keep
+their independent lifetime. Phase 3 discards the raw bearer token; MCP endpoints,
+downloads, token delivery to Claude, and agent tools remain pending.
+
+On restart, outstanding grants across the application database are invalidated
+independently of Docker reconciliation. If either recovery step fails, the web app
+stays available but conversation launches remain blocked until recovery succeeds.
+The sweeper retries invalidation and failed revocations; launch attempts also retry
+startup recovery. Container cleanup proceeds when token revocation fails, and the
+live assignment check immediately denies access to retired conversations. Run one
+app worker/replica and one deployment per application database.
+
 ## Google setup
 
 Enable Gmail API and Google Calendar API in Google Cloud. Create an OAuth **Web application** client and register exactly `http://localhost:8000/auth/google/callback` for local development or `https://YOUR_DOMAIN/auth/google/callback` for production. Request `openid`, `userinfo.email`, `gmail.readonly`, and `calendar.readonly`. The last two grant read access only. The callback validates OAuth state, PKCE, ID token nonce, verified email, Google `sub`, all requested scopes, and the presence of a refresh token.

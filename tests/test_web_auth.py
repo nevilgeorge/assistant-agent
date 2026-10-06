@@ -30,6 +30,13 @@ async def web(tmp_path, monkeypatch):
 
     config.get_settings.cache_clear()
     monkeypatch.setattr(module, "Sandbox", FakeSandbox)
+    # Production applies migrations before lifespan startup and grant invalidation.
+    setup_engine = module.make_async_engine(config.get_settings().database_url)
+    try:
+        async with setup_engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+    finally:
+        await setup_engine.dispose()
     application = module.create_app()
     clients = []
     try:
@@ -37,8 +44,6 @@ async def web(tmp_path, monkeypatch):
             await stack.enter_async_context(application.router.lifespan_context(application))
             state = application.state
             monkeypatch.setattr(state.conversation_manager, "process_factory", FakeProcess)
-            async with state.web_store.factory.kw["bind"].begin() as connection:
-                await connection.run_sync(Base.metadata.create_all)
             try:
                 yield SimpleNamespace(
                     app=application,
@@ -298,7 +303,7 @@ async def test_chat_routes_use_overridden_store_and_conversation_manager(web, mo
     )
     conversation = web.conversation_manager.get(user_id)
     injected_manager = SimpleNamespace(
-        submit=AsyncMock(return_value={"conversation_id": conversation.id, "turn_id": "injected-turn"}),
+        submit=AsyncMock(return_value={"conversation_id": conversation.conversation_id, "turn_id": "injected-turn"}),
         get=lambda user: conversation,
         reset=AsyncMock(),
     )
@@ -317,7 +322,7 @@ async def test_chat_routes_use_overridden_store_and_conversation_manager(web, mo
     assert response.json()["turn_id"] == "injected-turn"
     injected_manager.submit.assert_awaited_once_with(user_id, "Injected prompt", None)
     snapshot = await client.get("/api/conversation")
-    assert snapshot.json()["conversation_id"] == conversation.id
+    assert snapshot.json()["conversation_id"] == conversation.conversation_id
     stream = await client.get("/api/conversation/stream?conversation_id=old")
     assert '"type": "reload"' in stream.text
     reset = await client.post(
@@ -405,8 +410,8 @@ async def test_stream_replays_events_after_snapshot(web, monkeypatch):
     assert submitted.status_code == 202
     user = (await web.web_store.user_by_google_sub("sub-a")).user_id
     conversation = web.conversation_manager.get(user)
-    conversation.process.text("<script>alert(1)</script>")
-    conversation.process.finish()
+    conversation.claude_process.text("<script>alert(1)</script>")
+    conversation.claude_process.finish()
     await conversation.close()
     response = await client.get(
         "/api/conversation/stream",
@@ -561,7 +566,7 @@ async def test_stream_closes_when_authentication_expires(web, monkeypatch):
     monkeypatch.setattr(request, "is_disconnected", AsyncMock(return_value=False))
     monkeypatch.setattr(web.module, "HEARTBEAT_SECONDS", 0)
     response = await web.module.conversation_stream(
-        request, conversation.id, web.web_store, web.conversation_manager
+        request, conversation.conversation_id, web.web_store, web.conversation_manager
     )
     assert await anext(response.body_iterator) == ": heartbeat\n\n"
     async with web.web_store.factory.begin() as db:
@@ -580,7 +585,7 @@ async def test_stream_respects_last_event_id(web, monkeypatch):
     await conversation.close()
     response = await client.get(
         "/api/conversation/stream",
-        params={"conversation_id": conversation.id},
+        params={"conversation_id": conversation.conversation_id},
         headers={"Last-Event-ID": "1"},
     )
     assert "already-seen" not in response.text
@@ -588,7 +593,7 @@ async def test_stream_respects_last_event_id(web, monkeypatch):
     assert "id: 2" in response.text
     invalid = await client.get(
         "/api/conversation/stream",
-        params={"conversation_id": conversation.id},
+        params={"conversation_id": conversation.conversation_id},
         headers={"Last-Event-ID": "invalid"},
     )
     assert invalid.status_code == 400
@@ -721,3 +726,122 @@ async def test_disconnect_deletes_credentials_and_sessions_when_docker_cleanup_f
     assert await web.web_store.session(token) is None
     assert await web.web_store.user_by_google_sub("sub-a") is None
     web.conversation_manager.sandbox_service.destroy.assert_awaited_once_with(handle)
+
+
+async def test_sandbox_access_dependency_override_on_disconnect(web, monkeypatch):
+    from assistant_agent.web_dependencies import get_sandbox_access_service
+
+    client = await connect(web, monkeypatch, "access-user", "access@example.com")
+    session = await web.web_store.session(client.cookies.get(web.COOKIE))
+    injected_access_service = SimpleNamespace(revoke_user=AsyncMock(return_value=True))
+    web.app.dependency_overrides[get_sandbox_access_service] = lambda: injected_access_service
+    monkeypatch.delattr(web.app.state, "sandbox_access_service")
+    monkeypatch.setattr(web.module, "revoke", lambda creds: True)
+    response = await client.post("/disconnect", data={"csrf_token": session.csrf_token})
+    assert response.status_code == 303
+    injected_access_service.revoke_user.assert_awaited_once_with(session.user_id)
+
+
+async def test_web_grant_is_private_and_reset_preserves_browser_session(web, monkeypatch, caplog):
+    from sqlalchemy import select
+    from assistant_agent.database import SandboxAccessToken
+    from assistant_agent.sandbox_access import SandboxAuthorizationError
+    from assistant_agent.web_store import token_hash
+
+    client = await connect(web, monkeypatch, "grant-user", "grant@example.com")
+    session_token = client.cookies.get(web.COOKIE)
+    session = await web.web_store.session(session_token)
+    access_service = web.app.state.sandbox_access_service
+    original_issue = access_service.issue
+    issued_tokens = []
+
+    async def capture_issue(*identities):
+        issued_access = await original_issue(*identities)
+        issued_tokens.append(issued_access.raw_token)
+        return issued_access
+
+    monkeypatch.setattr(access_service, "issue", capture_issue)
+    response = await client.post(
+        "/api/message", json={"message": "Hello"},
+        headers={"X-CSRF-Token": session.csrf_token},
+    )
+    assert response.status_code == 202
+    raw_token, = issued_tokens
+    conversation = web.conversation_manager.get(session.user_id)
+    context = await access_service.authorize(
+        raw_token, "search_emails", web.conversation_manager.resolve_live_assignment
+    )
+    assert context.user_id == session.user_id
+    async with web.web_store.factory() as database_session:
+        grant = await database_session.scalar(select(SandboxAccessToken))
+        assert grant.token_hash == token_hash(raw_token)
+        assert raw_token not in repr(grant.__dict__)
+    assert raw_token not in repr(conversation.__dict__)
+    assert raw_token not in response.text
+    assert raw_token not in (await client.get("/api/conversation")).text
+    assert raw_token not in caplog.text
+    assert conversation.claude_process.sandbox_handle == conversation.sandbox_handle
+    await web.conversation_manager.reset(session.user_id)
+    with pytest.raises(SandboxAuthorizationError):
+        await access_service.authorize(
+            raw_token, "search_emails", web.conversation_manager.resolve_live_assignment
+        )
+    assert await web.web_store.session(session_token) is not None
+
+
+async def test_cancelled_disconnect_blocks_launch_and_finishes_deletion(web, monkeypatch):
+    client = await connect(web, monkeypatch, "cancel-user", "cancel@example.com")
+    session_token = client.cookies.get(web.COOKIE)
+    session = await web.web_store.session(session_token)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_reset = web.conversation_manager.reset
+
+    async def delayed_reset(user_id):
+        entered.set()
+        await release.wait()
+        await original_reset(user_id)
+
+    monkeypatch.setattr(web.conversation_manager, "reset", delayed_reset)
+    monkeypatch.setattr(web.module, "revoke", lambda creds: True)
+    request_task = asyncio.create_task(
+        client.post("/disconnect", data={"csrf_token": session.csrf_token})
+    )
+    await entered.wait()
+    with pytest.raises(ChatError):
+        await web.conversation_manager.submit(session.user_id, "Race")
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    cleanup_tasks = list(web.app.state.account_cleanup_tasks)
+    assert cleanup_tasks
+    release.set()
+    await asyncio.gather(*cleanup_tasks)
+    assert await web.web_store.user(session.user_id) is None
+    assert await web.web_store.session(session_token) is None
+
+
+async def test_restart_invalidation_preserves_browser_sessions_even_without_docker(web, monkeypatch):
+    from sqlalchemy import select
+    from assistant_agent.database import SandboxAccessToken
+    from test_chat import FakeSandbox
+
+    client = await connect(web, monkeypatch, "restart-user", "restart@example.com")
+    session_token = client.cookies.get(web.COOKIE)
+    session = await web.web_store.session(session_token)
+    issued_access = await web.app.state.sandbox_access_service.issue(
+        session.user_id, "previous-conversation", "previous-container"
+    )
+    sandbox_service = FakeSandbox()
+    sandbox_service.reconcile.side_effect = RuntimeError("Docker unavailable")
+    monkeypatch.setattr(web.module, "Sandbox", lambda: sandbox_service)
+    restarted_app = web.module.create_app()
+    async with restarted_app.router.lifespan_context(restarted_app):
+        assert restarted_app.state.conversation_manager.needs_cleanup
+        assert not restarted_app.state.conversation_manager.needs_access_invalidation
+        async with restarted_app.state.web_store.factory() as database_session:
+            grant = await database_session.scalar(
+                select(SandboxAccessToken).where(SandboxAccessToken.id == issued_access.token_id)
+            )
+            assert grant.revoked_at is not None
+        assert await restarted_app.state.web_store.session(session_token) is not None

@@ -7,12 +7,16 @@ import logging
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from assistant_agent import sandbox
 
 from .claude_process import ClaudeProcess
+
+if TYPE_CHECKING:
+    from assistant_agent.sandbox_access import SandboxAccessService
 
 logger = logging.getLogger(__name__)
 
@@ -26,70 +30,96 @@ class Conversation:
     and the conversation's lifetime is independent of browser connections.
     """
 
-    def __init__(self, user: str, service: sandbox.Sandbox, track: Callable) -> None:
+    def __init__(
+        self,
+        user_id: str,
+        sandbox_service: sandbox.Sandbox,
+        track_background_task: Callable[[Awaitable[None]], asyncio.Task[None]],
+        sandbox_access_service: SandboxAccessService | None = None,
+    ) -> None:
         """Initialize an empty conversation and its turn and replay state."""
-        self.user = user
-        self.service = service
-        self.track = track
-        self.handle: sandbox.SandboxHandle | None = None
-        self.id = uuid.uuid4().hex
-        self.transcript = []
-        self.events = deque(maxlen=2048)
-        self.sequence = 0
-        self.active = None
-        self.starting = False
-        self.failed = False
-        self.process = None
-        self.timer = None
-        self.last_used = time.monotonic()
-        self.bytes = 0
-        self.text_streamed = False
-        self.turn_started = None
-        self.teardown: asyncio.Task | None = None
-        self.retired = False
+        self.user_id: str = user_id
+        self.sandbox_service: sandbox.Sandbox = sandbox_service
+        self.track_background_task: Callable[[Awaitable[None]], asyncio.Task[None]] = (
+            track_background_task
+        )
+        self.sandbox_handle: sandbox.SandboxHandle | None = None
+        self.conversation_id: str = uuid.uuid4().hex
+        self.transcript_messages: list[dict[str, str]] = []
+        self.replay_events: deque[dict[str, Any]] = deque(maxlen=2048)
+        self.event_sequence: int = 0
+        self.active_turn_id: str | None = None
+        self.is_starting: bool = False
+        self.has_failed: bool = False
+        self.claude_process: ClaudeProcess | None = None
+        self.turn_timeout_handle: asyncio.TimerHandle | None = None
+        self.last_activity_monotonic: float = time.monotonic()
+        self.transcript_size_bytes: int = 0
+        self.has_streamed_turn_text: bool = False
+        self.turn_started_monotonic: float | None = None
+        self.cleanup_task: asyncio.Task[None] | None = None
+        self.is_retired: bool = False
+        self.sandbox_access_service: SandboxAccessService | None = sandbox_access_service
+        self.access_token_id: str | None = None
+        self.access_token_expires_at: datetime | None = None
+
+    def access_expired(self) -> bool:
+        """Check the fixed grant deadline without extending it between turns."""
+        return (
+            self.access_token_expires_at is not None
+            and datetime.now(UTC) >= self.access_token_expires_at
+        )
+
+    async def revoke_access(self) -> None:
+        """Attempt revocation before cleanup; the service retains failed retries."""
+        if self.sandbox_access_service is not None:
+            try:
+                await self.sandbox_access_service.revoke_conversation(self.conversation_id)
+            except Exception:
+                logger.warning("Conversation access revocation pending for %s", self.conversation_id)
 
     def emit(self, kind: str, **data: Any) -> None:
         """Add a sequenced event to the bounded replay buffer."""
-        self.sequence += 1
+        self.event_sequence += 1
         event = dict(
-            type=kind, conversation_id=self.id, turn_id=self.active, sequence=self.sequence, **data
+            type=kind, conversation_id=self.conversation_id, turn_id=self.active_turn_id, sequence=self.event_sequence, **data
         )
-        self.events.append(event)
+        self.replay_events.append(event)
 
     def snapshot(self) -> dict:
         """Copy the transcript and current turn state for API responses."""
         return dict(
-            conversation_id=self.id,
-            transcript=[dict(m) for m in self.transcript],
-            sequence=self.sequence,
-            active_turn=self.active,
-            failed=self.failed,
+            conversation_id=self.conversation_id,
+            transcript=[dict(m) for m in self.transcript_messages],
+            sequence=self.event_sequence,
+            active_turn=self.active_turn_id,
+            failed=self.has_failed,
         )
 
     def _fail(self, message: str) -> None:
         """Mark the conversation failed, cancel its timer, and emit a failure event."""
-        if self.failed:
+        if self.has_failed:
             return
-        self.failed = True
-        logger.info("Claude conversation %s failed", self.id)
-        if self.timer:
-            self.timer.cancel()
+        self.has_failed = True
+        logger.info("Claude conversation %s failed", self.conversation_id)
+        if self.turn_timeout_handle:
+            self.turn_timeout_handle.cancel()
         self.emit("turn_failure", message=message)
-        self.active = None
+        self.active_turn_id = None
 
     def fail(self, message: str, turn_id: str | None = None) -> None:
         """Fail the current turn and request cleanup, ignoring stale deadlines."""
-        if self.failed or (turn_id is not None and self.active != turn_id):
+        if self.has_failed or (turn_id is not None and self.active_turn_id != turn_id):
             return
         self._fail(message)
         self.request_close()
 
     def receive(self, message: dict) -> None:
         """Handle output for an active turn and request cleanup on failure."""
-        if not self.active or self.failed:
+        if not self.active_turn_id or self.has_failed:
             return
         self._receive(message)
-        process = self.process if self.failed else None
+        process = self.claude_process if self.has_failed else None
         if process:
             self.request_close()
 
@@ -101,8 +131,8 @@ class Conversation:
             delta = event.get("delta", {})
             if event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
                 self.append(delta.get("text", ""))
-                self.text_streamed = True
-        elif kind == "assistant" and not self.text_streamed:
+                self.has_streamed_turn_text = True
+        elif kind == "assistant" and not self.has_streamed_turn_text:
             for block in message.get("message", {}).get("content", []):
                 if block.get("type") == "text":
                     self.append(block.get("text", ""))
@@ -110,68 +140,71 @@ class Conversation:
             if message.get("is_error") or message.get("subtype") != "success":
                 self._fail("The assistant could not complete the turn. Start a new conversation.")
                 return
-            if not self.transcript[-1]["text"] and message.get("result"):
+            if not self.transcript_messages[-1]["text"] and message.get("result"):
                 self.append(message["result"])
-            if self.failed:
+            if self.has_failed:
                 return
-            self.timer.cancel()
+            self.turn_timeout_handle.cancel()
             logger.info(
                 "Claude conversation %s completed turn in %.2fs",
-                self.id,
-                time.monotonic() - self.turn_started,
+                self.conversation_id,
+                time.monotonic() - self.turn_started_monotonic,
             )
             self.emit("turn_completion")
-            self.active = None
-            self.last_used = time.monotonic()
+            self.active_turn_id = None
+            self.last_activity_monotonic = time.monotonic()
 
     def append(self, text: str) -> None:
         """Append assistant text and emit a delta within the transcript limit."""
-        if self.failed:
+        if self.has_failed:
             return
         size = len(text.encode())
-        if self.bytes + size > 2 * 1024 * 1024:
+        if self.transcript_size_bytes + size > 2 * 1024 * 1024:
             self._fail("Conversation limit reached. Start a new conversation.")
             return
-        self.bytes += size
-        self.transcript[-1]["text"] += text
+        self.transcript_size_bytes += size
+        self.transcript_messages[-1]["text"] += text
         self.emit("assistant_delta", text=text)
 
     def retire(self, reason: str = "Conversation reset.") -> ClaudeProcess | None:
         """End the conversation once and return its process for cleanup."""
-        if self.retired:
-            return self.process
-        self.retired = True
-        if self.timer:
-            self.timer.cancel()
-        self.failed = True
+        if self.is_retired:
+            return self.claude_process
+        self.is_retired = True
+        if self.turn_timeout_handle:
+            self.turn_timeout_handle.cancel()
+        self.has_failed = True
         self.emit("conversation_reset", message=reason)
-        logger.info("Claude conversation %s retired", self.id)
-        self.active = None
-        return self.process
+        logger.info("Claude conversation %s retired", self.conversation_id)
+        self.active_turn_id = None
+        return self.claude_process
 
     def request_close(self) -> None:
         """Schedule process cleanup once without blocking state updates."""
-        if not self.starting and self.teardown is None:
-            self.teardown = self.track(self._close())
+        if not self.is_starting and self.cleanup_task is None:
+            self.cleanup_task = self.track_background_task(self._close())
 
     async def _close(self) -> None:
         """Remove the assignment even when process termination fails."""
+        await self.revoke_access()
         try:
-            if self.process:
-                await self.process.close()
+            if self.claude_process:
+                await self.claude_process.close()
         except Exception:
             logger.warning("Could not close conversation process")
         finally:
-            if self.handle:
+            if self.sandbox_handle:
                 try:
-                    await self.service.destroy(self.handle)
+                    await self.sandbox_service.destroy(self.sandbox_handle)
                 except Exception:
-                    logger.warning("Sandbox removal pending for conversation %s", self.id)
+                    logger.warning("Sandbox removal pending for conversation %s", self.conversation_id)
 
     async def close(self, reason: str = "Conversation reset.") -> None:
         """Retire the conversation and wait for its process cleanup."""
         self.retire(reason)
+        if self.is_starting:
+            # Startup owns final cleanup and repeats revocation after any in-flight issue.
+            await self.revoke_access()
         self.request_close()
-        if self.teardown:
-            await asyncio.shield(self.teardown)
-
+        if self.cleanup_task:
+            await asyncio.shield(self.cleanup_task)

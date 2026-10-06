@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from assistant_agent.sandbox import Sandbox
+from assistant_agent.sandbox_access import SandboxAccessService
 from assistant_agent.async_workers import AsyncWorker
 from assistant_agent.database import make_async_engine, make_async_session_factory
 from assistant_agent.chat import ChatError, Conversation, ConversationManager
@@ -33,6 +34,7 @@ from assistant_agent.web_dependencies import (
     get_application_settings,
     get_conversation_manager,
     get_google_worker,
+    get_sandbox_access_service,
     get_web_store,
 )
 
@@ -49,21 +51,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = make_async_engine(settings.database_url)
     conversation_manager = None
     gmail_service = None
+    account_cleanup_tasks: set[asyncio.Task[None]] = set()
+    app.state.account_cleanup_tasks = account_cleanup_tasks
     sandbox_service = Sandbox()
     try:
         google_worker = AsyncWorker()
+        session_factory = make_async_session_factory(engine)
         web_store = WebStore(
-            make_async_session_factory(engine),
+            session_factory,
             settings.credential_encryption_key,
             google_worker,
         )
         gmail_service = GmailService(web_store)
-        conversation_manager = ConversationManager(service=sandbox_service)
+        sandbox_access_service = SandboxAccessService(session_factory)
+        conversation_manager = ConversationManager(
+            service=sandbox_service, access_service=sandbox_access_service
+        )
         app.state.settings = settings
         app.state.google_worker = google_worker
         app.state.web_store = web_store
         app.state.gmail_service = gmail_service
         app.state.sandbox_service = sandbox_service
+        app.state.sandbox_access_service = sandbox_access_service
         app.state.conversation_manager = conversation_manager
         await conversation_manager.start()
         yield
@@ -71,6 +80,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Cleanup also runs if startup fails or the lifespan is cancelled.
         with CancelScope(shield=True):
             try:
+                if account_cleanup_tasks:
+                    await asyncio.gather(*list(account_cleanup_tasks), return_exceptions=True)
                 if conversation_manager is not None:
                     await conversation_manager.close()
             finally:
@@ -207,6 +218,7 @@ async def disconnect(
     web_store: Annotated[WebStore, Depends(get_web_store)],
     google_worker: Annotated[AsyncWorker, Depends(get_google_worker)],
     conversation_manager: Annotated[ConversationManager, Depends(get_conversation_manager)],
+    sandbox_access_service: Annotated[SandboxAccessService, Depends(get_sandbox_access_service)],
 ):
     token = request.cookies.get(COOKIE)
     session = await web_store.session(token)
@@ -216,13 +228,27 @@ async def disconnect(
     supplied = form.get("csrf_token")
     if not isinstance(supplied, str) or not hmac.compare_digest(session.csrf_token, supplied):
         return _bad_request("CSRF token mismatch.")
-    creds = await web_store.load_credentials(session.user_id)
-    if creds:
-        await google_worker.run(revoke, creds)
-    try:
-        await conversation_manager.reset(session.user_id)
-    finally:
-        await web_store.disconnect(session.user_id)
+    conversation_manager.block_user(session.user_id)
+    async def disconnect_account() -> None:
+        try:
+            await conversation_manager.reset(session.user_id)
+        finally:
+            try:
+                await sandbox_access_service.revoke_user(session.user_id)
+                creds = await web_store.load_credentials(session.user_id)
+                if creds:
+                    await google_worker.run(revoke, creds)
+            finally:
+                await web_store.disconnect(session.user_id)
+
+    # Accepted account deletion survives a cancelled browser request.
+    disconnect_task = asyncio.create_task(disconnect_account())
+    request.app.state.account_cleanup_tasks.add(disconnect_task)
+    disconnect_task.add_done_callback(request.app.state.account_cleanup_tasks.discard)
+    disconnect_task.add_done_callback(
+        lambda task: task.exception() if not task.cancelled() else None
+    )
+    await asyncio.shield(disconnect_task)
     response = RedirectResponse("/", status_code=303)
     response.delete_cookie(COOKIE, path="/")
     return response
@@ -361,9 +387,9 @@ def _event_batch(
     conversation: Conversation, conversation_id: str, cursor: int
 ) -> tuple[bool, list[dict]]:
     """Copy replay state synchronously on the owning event loop."""
-    oldest = conversation.events[0]["sequence"] if conversation.events else conversation.sequence + 1
-    missing = conversation_id != conversation.id or cursor < oldest - 1 or cursor > conversation.sequence
-    pending = [dict(e) for e in conversation.events if e["sequence"] > cursor]
+    oldest = conversation.replay_events[0]["sequence"] if conversation.replay_events else conversation.event_sequence + 1
+    missing = conversation_id != conversation.conversation_id or cursor < oldest - 1 or cursor > conversation.event_sequence
+    pending = [dict(e) for e in conversation.replay_events if e["sequence"] > cursor]
     return missing, pending
 
 

@@ -133,17 +133,17 @@ for line in sys.stdin:
         try:
             await manager.submit("test", "first")
             conversation = manager.get("test")
-            process = conversation.process
+            process = conversation.claude_process
             async with asyncio.timeout(5):
-                while conversation.active:
+                while conversation.active_turn_id:
                     await asyncio.sleep(0.01)
             await manager.submit("test", "雪 second")
             async with asyncio.timeout(5):
-                while conversation.active:
+                while conversation.active_turn_id:
                     await asyncio.sleep(0.01)
-            assert not conversation.failed and conversation.process is process
-            assert conversation.transcript[-1]["text"] == "雪 second"
-            handle = conversation.handle
+            assert not conversation.has_failed and conversation.claude_process is process
+            assert conversation.transcript_messages[-1]["text"] == "雪 second"
+            handle = conversation.sandbox_handle
             child = (await service.run(f"cat {shlex.quote(child_path)}", name=handle.container_id)).output.strip()
             assert child.isdigit()
             await manager.reset("test")

@@ -106,7 +106,7 @@ Direct HTTP is the simplest supported transport. A reverse proxy on separate san
 
 ## Development Plan
 
-Use each phase below as the scope for a separate Codex implementation plan. Phase 1 is implemented; phases 2–6 are pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4. Keep agent tools disabled until phase 5.
+Use each phase below as the scope for a separate Codex implementation plan. Phases 1–3 are implemented; phases 4–6 are pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4. Keep agent tools disabled until phase 5.
 
 | Phase | Design sections |
 | --- | --- |
@@ -161,6 +161,17 @@ Cancellation stops queued Gmail requests and further preview scheduling, while a
 - Add the `SandboxAccessToken` model and Alembic migration; implement generation, hash-only storage, validation, expiration, and revocation in `sandbox_access.py`.
 - Bind grants to the active user/conversation/container; use server-side tool permissions and destination resolution. Wire revocation into lifecycle failures, teardown, account disconnection, and restart recovery.
 - **Complete when:** migration and authorization tests cover valid, missing, expired, revoked, inactive, and cross-user grants. Browser sessions remain independent; raw tokens never enter database records or logs.
+
+Implemented with Alembic revision `0004` and `SandboxAccessService`, shared through
+the web lifespan and a typed dependency. Grants have a fixed 24-hour expiry and
+resolve trusted identities and input paths from a ready live assignment. Each
+launch issues a grant after sandbox readiness; phase 3 discards the raw token.
+Retirement denies authorization synchronously, followed by database revocation
+before process and container cleanup. Failed revocations are retried by the
+sweeper. Restart invalidates outstanding grants even when Docker is unavailable;
+failed invalidation blocks launches until recovery succeeds. Apply `0004` before
+starting the app, with one worker/replica and one deployment per database. No MCP
+routes, downloads, Claude bearer environment, or tool activation are included.
 
 ### Phase 4 — MCP endpoint and downloads
 

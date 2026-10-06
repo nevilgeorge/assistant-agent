@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import shlex
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from aiodocker.stream import Stream
 
@@ -48,14 +48,17 @@ class ClaudeProcess:
         self.output_reader_task: asyncio.Task | None = None
         self.teardown_task: asyncio.Task | None = None
         self.stdin_write_lock = asyncio.Lock()
+        self.before_close: Callable[[], Awaitable[None]] | None = None
 
     @classmethod
     async def create(
         cls, token: str, receive: Callable, failed: Callable, sandbox_service: sandbox.Sandbox,
-        sandbox_handle: sandbox.SandboxHandle,
+        sandbox_handle: sandbox.SandboxHandle, *,
+        before_close: Callable[[], Awaitable[None]] | None = None,
     ) -> ClaudeProcess:
         """Start Claude, attach its stream, and wait for process readiness."""
         self = cls(sandbox_service, sandbox_handle)
+        self.before_close = before_close
         self.path = f"/tmp/assistant-chat-{token}.pid"
         try:
             async with asyncio.timeout(constants.STARTUP_SECONDS):
@@ -131,6 +134,11 @@ class ClaudeProcess:
 
     async def _close(self) -> None:
         """Terminate the process group, close the stream, and join the reader."""
+        if self.before_close is not None:
+            try:
+                await self.before_close()
+            except Exception:
+                logger.warning("Conversation access revocation pending before process cleanup")
         try:
             async with asyncio.timeout(constants.TEARDOWN_SECONDS):
                 await self.sandbox_service.run(
@@ -153,4 +161,3 @@ class ClaudeProcess:
                 if self.output_reader_task:
                     self.output_reader_task.cancel()
                     await asyncio.gather(self.output_reader_task, return_exceptions=True)
-

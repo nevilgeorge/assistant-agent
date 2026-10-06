@@ -7,6 +7,7 @@ from assistant_agent.chat import ConversationManager
 from assistant_agent.config import Settings
 from assistant_agent.gmail_service import GmailService
 from assistant_agent.sandbox import Sandbox
+from assistant_agent.sandbox_access import SandboxAccessService
 from assistant_agent.web_store import WebStore
 
 
@@ -28,6 +29,10 @@ async def get_conversation_manager(request: Request) -> ConversationManager:
 
 async def get_sandbox_service(request: Request) -> Sandbox:
     return request.app.state.sandbox_service
+
+
+async def get_sandbox_access_service(request: Request) -> SandboxAccessService:
+    return request.app.state.sandbox_access_service
 
 
 async def get_gmail_service(request: Request) -> GmailService:

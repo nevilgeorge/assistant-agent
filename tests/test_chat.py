@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -54,7 +55,7 @@ class FakeProcess:
         self.is_closed = True
 
     @classmethod
-    async def create(cls, token, receive, failed, service, handle):
+    async def create(cls, token, receive, failed, service, handle, *, before_close=None):
         process = cls(token, receive, failed)
         process.sandbox_handle = handle
         return process
@@ -84,7 +85,7 @@ async def manager():
 async def test_multiple_turns_stream_without_restarting_process(manager):
     first = await manager.submit("alice", "Remember blue")
     conversation = manager.get("alice")
-    process = conversation.process
+    process = conversation.claude_process
     with pytest.raises(ChatError, match="progress"):
         await manager.submit("alice", "overlap")
     process.text("Bl")
@@ -94,14 +95,14 @@ async def test_multiple_turns_stream_without_restarting_process(manager):
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "Blue"}]}}
     )
     assert conversation.snapshot()["transcript"][-1]["text"] == "Blue"
-    assert conversation.active == first["turn_id"]
+    assert conversation.active_turn_id == first["turn_id"]
     process.finish()
     second = await manager.submit("alice", "What color?")
-    assert conversation.process is process and first["turn_id"] != second["turn_id"]
+    assert conversation.claude_process is process and first["turn_id"] != second["turn_id"]
     assert process.prompts == ["Remember blue", "What color?"]
     process.text("Blue again")
     process.finish()
-    assert [e["type"] for e in conversation.events].count("turn_completion") == 2
+    assert [e["type"] for e in conversation.replay_events].count("turn_completion") == 2
     assert conversation.snapshot()["active_turn"] is None
 
 
@@ -109,43 +110,43 @@ async def test_isolation_reset_failure_and_capacity(manager):
     manager.max_conversations = 2
     await manager.submit("alice", "private")
     await manager.submit("bob", "other")
-    assert manager.get("alice").process is not manager.get("bob").process
+    assert manager.get("alice").claude_process is not manager.get("bob").claude_process
     with pytest.raises(ChatError) as exc:
         manager.get("carol")
     assert exc.value.status == 503
     old = manager.get("alice")
-    old.process.failed("Ended")
-    await old.teardown
-    assert old.process.is_closed and old.failed
+    old.claude_process.failed("Ended")
+    await old.cleanup_task
+    assert old.claude_process.is_closed and old.has_failed
     with pytest.raises(ChatError, match="new conversation"):
         await manager.submit("alice", "follow-up")
     await manager.reset("alice")
-    assert old.events[-1]["type"] == "conversation_reset"
-    assert manager.get("alice").id != old.id
+    assert old.replay_events[-1]["type"] == "conversation_reset"
+    assert manager.get("alice").conversation_id != old.conversation_id
     with pytest.raises(ChatError, match="Reload"):
-        await manager.submit("alice", "stale", old.id)
+        await manager.submit("alice", "stale", old.conversation_id)
 
 
 async def test_timeout_does_not_apply_to_later_turn(manager):
     first = await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    conversation.process.finish()
+    conversation.claude_process.finish()
     await manager.submit("alice", "two")
     manager._timeout(conversation, first["turn_id"])
-    assert not conversation.failed
-    manager._timeout(conversation, conversation.active)
-    await conversation.teardown
-    assert conversation.failed and conversation.process.is_closed
-    assert conversation.events[-1]["type"] == "turn_failure"
+    assert not conversation.has_failed
+    manager._timeout(conversation, conversation.active_turn_id)
+    await conversation.cleanup_task
+    assert conversation.has_failed and conversation.claude_process.is_closed
+    assert conversation.replay_events[-1]["type"] == "turn_failure"
 
 
 async def test_limits_and_shutdown(manager):
     await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    conversation.bytes = 2 * 1024 * 1024
-    conversation.process.text("overflow")
-    await conversation.teardown
-    assert conversation.failed and conversation.process.is_closed
+    conversation.transcript_size_bytes = 2 * 1024 * 1024
+    conversation.claude_process.text("overflow")
+    await conversation.cleanup_task
+    assert conversation.has_failed and conversation.claude_process.is_closed
     await manager.close()
     assert not manager.conversations
 
@@ -153,11 +154,11 @@ async def test_limits_and_shutdown(manager):
 async def test_result_failure_retains_partial_output(manager):
     await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    conversation.process.text("partial")
-    conversation.process.receive({"type": "result", "subtype": "error_max_turns", "is_error": True})
-    await conversation.teardown
+    conversation.claude_process.text("partial")
+    conversation.claude_process.receive({"type": "result", "subtype": "error_max_turns", "is_error": True})
+    await conversation.cleanup_task
     assert conversation.snapshot()["transcript"][-1]["text"] == "partial"
-    assert conversation.failed and conversation.process.is_closed
+    assert conversation.has_failed and conversation.claude_process.is_closed
 
 
 class Gate:
@@ -166,7 +167,7 @@ class Gate:
         self.release = asyncio.Event()
         self.made = []
 
-    async def create(self, token, receive, failed, service, handle):
+    async def create(self, token, receive, failed, service, handle, *, before_close=None):
         self.entered.set()
         await self.release.wait()
         self.made.append(FakeProcess(token, receive, failed))
@@ -182,13 +183,13 @@ async def test_spawn_does_not_block_other_callers(manager):
     assert conversation.snapshot()["active_turn"] is None
     with pytest.raises(ChatError, match="progress"):
         await manager.submit("alice", "two")
-    conversation.last_used = 0
+    conversation.last_activity_monotonic = 0
     await manager.sweep_once()
     assert manager.conversations["alice"] is conversation
     gate.release.set()
     outcome = await task
-    assert outcome["turn_id"] == conversation.active
-    assert conversation.process.prompts == ["one"] and not conversation.starting
+    assert outcome["turn_id"] == conversation.active_turn_id
+    assert conversation.claude_process.prompts == ["one"] and not conversation.is_starting
 
 
 @pytest.mark.parametrize("shutdown", [False, True], ids=["reset", "shutdown"])
@@ -210,8 +211,8 @@ async def test_reset_or_shutdown_during_spawn(manager, shutdown):
         await closing
     assert exc.value.status == 503
     assert gate.made[0].is_closed and gate.made[0].prompts == []
-    assert [e["type"] for e in conversation.events] == ["conversation_reset"]
-    assert not conversation.starting and not conversation.active
+    assert [e["type"] for e in conversation.replay_events] == ["conversation_reset"]
+    assert not conversation.is_starting and not conversation.active_turn_id
 
 
 async def test_request_cancellation_preserves_reserved_submission(manager):
@@ -224,7 +225,7 @@ async def test_request_cancellation_preserves_reserved_submission(manager):
     gate.release.set()
     await asyncio.gather(*manager.background_tasks)
     conversation = manager.get("alice")
-    assert conversation.process.prompts == ["one"] and not conversation.starting
+    assert conversation.claude_process.prompts == ["one"] and not conversation.is_starting
     assert not manager.background_tasks
 
 
@@ -259,8 +260,8 @@ async def test_transport_failure_during_spawn(manager):
         await manager.submit("alice", "one")
     conversation = manager.get("alice")
     assert made[0].is_closed and not made[0].prompts
-    assert [e["type"] for e in conversation.events] == ["turn_failure"]
-    assert not conversation.starting
+    assert [e["type"] for e in conversation.replay_events] == ["turn_failure"]
+    assert not conversation.is_starting
 
 
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
@@ -269,8 +270,8 @@ async def test_spawn_failure_releases_reservation(manager, error):
     with pytest.raises(ChatError if error is RuntimeError else error):
         await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    assert not conversation.starting and not conversation.events
-    assert conversation.failed is (error is RuntimeError)
+    assert not conversation.is_starting and not conversation.replay_events
+    assert conversation.has_failed is (error is RuntimeError)
 
 
 async def test_cleanup_runs_once_before_any_spawn(manager, monkeypatch):
@@ -312,10 +313,10 @@ async def test_failed_cleanup_blocks_spawn_and_is_retried(manager, monkeypatch):
 async def test_idle_conversations_expire_but_active_conversations_stay(manager):
     await manager.submit("active", "one")
     idle = manager.get("idle")
-    idle.last_used = 0
+    idle.last_activity_monotonic = 0
     await manager.sweep_once()
     assert "idle" not in manager.conversations
-    assert idle.events[-1]["type"] == "conversation_reset"
+    assert idle.replay_events[-1]["type"] == "conversation_reset"
     assert "active" in manager.conversations
 
 
@@ -392,13 +393,13 @@ async def test_transport_invalid_output_fails_and_cleans_up(transport, message):
 async def test_send_failure_retains_partial_output_and_closes(manager):
     await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    conversation.process.text("partial")
-    conversation.process.finish()
-    conversation.process.send = AsyncMock(side_effect=OSError("closed"))
+    conversation.claude_process.text("partial")
+    conversation.claude_process.finish()
+    conversation.claude_process.send = AsyncMock(side_effect=OSError("closed"))
     await manager.submit("alice", "two")
-    await conversation.teardown
-    assert conversation.failed and conversation.process.is_closed
-    assert conversation.transcript[1]["text"] == "partial"
+    await conversation.cleanup_task
+    assert conversation.has_failed and conversation.claude_process.is_closed
+    assert conversation.transcript_messages[1]["text"] == "partial"
 
 
 @pytest.mark.parametrize("cancel", [False, True])
@@ -436,19 +437,19 @@ async def test_real_claude_multiple_turns():
         await manager.submit("integration", "Remember the codeword cobalt. Reply with only OK.")
         conversation = manager.get("integration")
         async with asyncio.timeout(125):
-            while conversation.active:
+            while conversation.active_turn_id:
                 await asyncio.sleep(0.1)
-        assert not conversation.failed
-        process = conversation.process
+        assert not conversation.has_failed
+        process = conversation.claude_process
         await manager.submit(
             "integration", "What codeword did I give you? Reply with only that word."
         )
         async with asyncio.timeout(125):
-            while conversation.active:
+            while conversation.active_turn_id:
                 await asyncio.sleep(0.1)
-        assert not conversation.failed and conversation.process is process
-        assert "cobalt" in conversation.transcript[-1]["text"].lower()
-        assert any(e["type"] == "assistant_delta" for e in conversation.events)
+        assert not conversation.has_failed and conversation.claude_process is process
+        assert "cobalt" in conversation.transcript_messages[-1]["text"].lower()
+        assert any(e["type"] == "assistant_delta" for e in conversation.replay_events)
         await manager.reset("integration")
         assert process.is_closed
         assert not (await process.execution.inspect())["Running"]
@@ -459,16 +460,16 @@ async def test_real_claude_multiple_turns():
 async def test_shutdown_joins_cleanup_of_conversation_removed_by_sweeper(manager):
     await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    conversation.process.finish()
-    conversation.last_used = 0
+    conversation.claude_process.finish()
+    conversation.last_activity_monotonic = 0
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def close():
         entered.set()
         await release.wait()
-        conversation.process.is_closed = True
+        conversation.claude_process.is_closed = True
 
-    conversation.process.close = close
+    conversation.claude_process.close = close
     sweep = asyncio.create_task(manager.sweep_once())
     await entered.wait()
     sweep.cancel()
@@ -479,8 +480,8 @@ async def test_shutdown_joins_cleanup_of_conversation_removed_by_sweeper(manager
     assert not closing.done()
     release.set()
     await closing
-    assert conversation.process.is_closed and not manager.background_tasks
-    assert conversation.timer.cancelled()
+    assert conversation.claude_process.is_closed and not manager.background_tasks
+    assert conversation.turn_timeout_handle.cancelled()
 
 
 async def test_startup_deadline_releases_stream(monkeypatch):
@@ -516,15 +517,15 @@ async def test_assignment_is_allocated_on_prompt_and_reused(manager):
     alice = manager.get("alice")
     assert not manager.sandbox_service.allocated
     await manager.submit("alice", "one")
-    alice.process.finish()
+    alice.claude_process.finish()
     await manager.submit("alice", "two")
     await manager.submit("bob", "one")
     assert len(manager.sandbox_service.allocated) == 2
     first, second = manager.sandbox_service.allocated
     assert first.user_id == "alice" and second.user_id == "bob"
-    assert first.conversation_id == alice.id
-    assert alice.process.sandbox_handle is first
-    assert manager.get("bob").process.sandbox_handle is second
+    assert first.conversation_id == alice.conversation_id
+    assert alice.claude_process.sandbox_handle is first
+    assert manager.get("bob").claude_process.sandbox_handle is second
     assert first.container_id != second.container_id
     assert first.host_input_path != second.host_input_path
     assert first.app_input_path != second.app_input_path
@@ -580,7 +581,7 @@ async def test_cancelled_request_preserves_allocation(manager):
         await task
     release.set()
     await asyncio.gather(*manager.background_tasks)
-    assert manager.get("alice").process.prompts == ["one"]
+    assert manager.get("alice").claude_process.prompts == ["one"]
     assert len(manager.sandbox_service.allocated) == 1 and not manager.sandbox_service.destroyed
 
 
@@ -588,7 +589,7 @@ async def test_process_failure_destroys_assignment_without_process(manager):
     manager.process_factory = SimpleNamespace(create=AsyncMock(side_effect=RuntimeError("attachment")))
     with pytest.raises(ChatError):
         await manager.submit("alice", "one")
-    assert manager.get("alice").process is None
+    assert manager.get("alice").claude_process is None
     assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
     assert len(manager.sandbox_service.destroyed) == 1
 
@@ -596,7 +597,7 @@ async def test_process_failure_destroys_assignment_without_process(manager):
 async def test_container_destruction_runs_after_process_cleanup_failure(manager):
     await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    conversation.process.close = AsyncMock(side_effect=RuntimeError("termination failed"))
+    conversation.claude_process.close = AsyncMock(side_effect=RuntimeError("termination failed"))
     await manager.reset("alice")
     assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
 
@@ -609,3 +610,428 @@ async def test_exec_credentials_are_only_process_environment(transport):
     assert "ANTHROPIC_API_KEY" not in call.args[0]
     assert "secret-api-key" not in call.args[0]
     assert all(call.kwargs["name"] == "test-container" for call in service.run.call_args_list)
+
+
+class FakeAccessService:
+    def __init__(self):
+        self.issued = []
+        self.revoked = []
+        self.invalidate_outstanding = AsyncMock()
+        self.retry_failed_revocations = AsyncMock()
+
+    async def issue(self, user_id, conversation_id, container_id):
+        self.issued.append((user_id, conversation_id, container_id))
+        return SimpleNamespace(
+            token_id="grant-id", raw_token="private-bearer-token",
+            expires_at=datetime.now(UTC) + timedelta(hours=24),
+        )
+
+    async def revoke_conversation(self, conversation_id):
+        self.revoked.append(conversation_id)
+        return True
+
+
+@pytest.fixture
+async def access_manager():
+    access_service = FakeAccessService()
+    conversation_manager = ConversationManager(
+        FakeProcess, service=FakeSandbox(), access_service=access_service,
+    )
+    yield conversation_manager, access_service
+    await conversation_manager.close()
+
+
+async def test_access_issue_before_process_start_and_fixed_between_turns(access_manager, caplog):
+    conversation_manager, access_service = access_manager
+    observed = []
+
+    class InspectingFactory(FakeProcess):
+        @classmethod
+        async def create(
+            cls, conversation_id, receive, failed, service, handle, *, before_close=None,
+        ):
+            observed.append(access_service.issued[-1])
+            assert conversation_manager.resolve_live_assignment(
+                handle.user_id, handle.conversation_id, handle.container_id,
+            ) is None
+            return await super().create(
+                conversation_id, receive, failed, service, handle, before_close=before_close,
+            )
+
+    conversation_manager.process_factory = InspectingFactory
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    deadline = conversation.access_token_expires_at
+    assert observed == [("alice", conversation.conversation_id, conversation.sandbox_handle.container_id)]
+    assert conversation.access_token_id == "grant-id"
+    conversation.claude_process.finish()
+    assert conversation_manager.resolve_live_assignment(
+        "alice", conversation.conversation_id, conversation.sandbox_handle.container_id,
+    ) is conversation.sandbox_handle
+    await conversation_manager.submit("alice", "two")
+    assert len(access_service.issued) == 1 and conversation.access_token_expires_at == deadline
+    assert "private-bearer-token" not in repr(vars(conversation))
+    assert "private-bearer-token" not in repr(conversation.snapshot())
+    assert "private-bearer-token" not in caplog.text
+
+
+async def test_live_assignment_lookup_denies_wrong_or_inactive_identity(access_manager):
+    conversation_manager, _ = access_manager
+    assert conversation_manager.resolve_live_assignment("unknown", "unknown", "unknown") is None
+    assert not conversation_manager.conversations
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    container_id = conversation.sandbox_handle.container_id
+    resolver = conversation_manager.resolve_live_assignment
+    assert resolver("bob", conversation.conversation_id, container_id) is None
+    assert resolver("alice", "different", container_id) is None
+    assert resolver("alice", conversation.conversation_id, "different") is None
+    for field in ("is_starting", "has_failed", "is_retired"):
+        setattr(conversation, field, True)
+        assert resolver("alice", conversation.conversation_id, container_id) is None
+        setattr(conversation, field, False)
+    conversation.claude_process.is_closed = True
+    assert resolver("alice", conversation.conversation_id, container_id) is None
+    conversation.claude_process.is_closed = False
+    conversation.access_token_expires_at = datetime.now(UTC)
+    assert resolver("alice", conversation.conversation_id, container_id) is None
+
+
+@pytest.mark.parametrize("retirement", ["reset", "failure", "timeout", "shutdown"])
+async def test_access_revoked_before_process_and_container_cleanup(access_manager, retirement):
+    conversation_manager, access_service = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    original_close = conversation.claude_process.close
+    original_destroy = conversation_manager.sandbox_service.destroy
+
+    async def close():
+        assert conversation.conversation_id in access_service.revoked
+        assert conversation_manager.resolve_live_assignment(
+            "alice", conversation.conversation_id, conversation.sandbox_handle.container_id,
+        ) is None
+        await original_close()
+
+    async def destroy(handle):
+        assert conversation.conversation_id in access_service.revoked
+        await original_destroy(handle)
+
+    conversation.claude_process.close = close
+    conversation_manager.sandbox_service.destroy = destroy
+    if retirement == "reset":
+        await conversation_manager.reset("alice")
+    elif retirement == "shutdown":
+        await conversation_manager.close()
+    else:
+        if retirement == "failure":
+            conversation.fail("transport ended")
+        else:
+            conversation_manager._timeout(conversation, conversation.active_turn_id)
+        await conversation.cleanup_task
+    assert access_service.revoked == [conversation.conversation_id]
+    assert conversation.claude_process.is_closed
+
+
+async def test_failed_revocation_does_not_prevent_cleanup_and_sweeper_retries(access_manager):
+    conversation_manager, access_service = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    access_service.revoke_conversation = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    await conversation_manager.reset("alice")
+    assert conversation.claude_process.is_closed
+    assert conversation_manager.sandbox_service.destroyed == [conversation.sandbox_handle]
+    await conversation_manager.sweep_once()
+    access_service.retry_failed_revocations.assert_awaited_once()
+
+
+@pytest.mark.parametrize("failure_stage", ["issue", "process"])
+async def test_access_issue_and_process_failures_revoke_and_destroy(access_manager, failure_stage):
+    conversation_manager, access_service = access_manager
+    if failure_stage == "issue":
+        access_service.issue = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    else:
+        conversation_manager.process_factory = SimpleNamespace(
+            create=AsyncMock(side_effect=RuntimeError("startup failed")),
+        )
+    with pytest.raises(ChatError, match="unavailable"):
+        await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    assert access_service.revoked == [conversation.conversation_id]
+    assert conversation.has_failed and not conversation.is_starting
+    assert conversation_manager.sandbox_service.destroyed == [conversation.sandbox_handle]
+
+
+@pytest.mark.parametrize("retirement", ["reset", "shutdown", "disconnect"])
+async def test_retirement_during_token_issue_revokes_late_grant(access_manager, retirement):
+    conversation_manager, access_service = access_manager
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_issue = access_service.issue
+
+    async def issue(*args):
+        entered.set()
+        await release.wait()
+        return await original_issue(*args)
+
+    access_service.issue = issue
+    process_factory = SimpleNamespace(create=AsyncMock())
+    conversation_manager.process_factory = process_factory
+    submitting = asyncio.create_task(conversation_manager.submit("alice", "one"))
+    await entered.wait()
+    conversation = conversation_manager.get("alice")
+    closing = None
+    if retirement == "shutdown":
+        closing = asyncio.create_task(conversation_manager.close())
+        await asyncio.sleep(0)
+    else:
+        if retirement == "disconnect":
+            conversation_manager.block_user("alice")
+        await conversation_manager.reset("alice")
+    assert conversation.is_retired
+    release.set()
+    with pytest.raises(ChatError):
+        await submitting
+    if closing is not None:
+        await closing
+    assert not process_factory.create.called
+    assert access_service.revoked[-1] == conversation.conversation_id
+    if retirement != "shutdown":
+        assert len(access_service.revoked) >= 2
+    assert conversation_manager.sandbox_service.destroyed == [conversation.sandbox_handle]
+    if retirement == "disconnect":
+        with pytest.raises(ChatError, match="unavailable"):
+            await conversation_manager.submit("alice", "new")
+
+
+@pytest.mark.parametrize("via_sweeper", [False, True])
+async def test_access_expiry_retires_active_conversation(access_manager, via_sweeper):
+    conversation_manager, access_service = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    conversation.access_token_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    if via_sweeper:
+        await conversation_manager.sweep_once()
+        assert "alice" not in conversation_manager.conversations
+    else:
+        with pytest.raises(ChatError, match="expired"):
+            await conversation_manager.submit("alice", "two")
+        await conversation.cleanup_task
+    assert conversation.is_retired and conversation.claude_process.is_closed
+    assert access_service.revoked == [conversation.conversation_id]
+    assert conversation.claude_process.prompts == ["one"]
+
+
+async def test_restart_invalidation_independent_of_docker_cleanup_and_retried(access_manager):
+    conversation_manager, access_service = access_manager
+    access_service.invalidate_outstanding.side_effect = RuntimeError("database unavailable")
+    await conversation_manager.start()
+    conversation_manager.sandbox_service.reconcile.assert_awaited_once()
+    assert conversation_manager.needs_access_invalidation
+    assert not conversation_manager.needs_cleanup
+    with pytest.raises(ChatError, match="unavailable"):
+        await conversation_manager.submit("alice", "one")
+    assert not conversation_manager.sandbox_service.allocated
+    await conversation_manager.reset("alice")
+    access_service.invalidate_outstanding.side_effect = None
+    await conversation_manager.sweep_once()
+    assert not conversation_manager.needs_access_invalidation
+    await asyncio.gather(
+        conversation_manager.submit("alice", "one"),
+        conversation_manager.submit("bob", "two"),
+    )
+    assert access_service.invalidate_outstanding.await_count == 3
+
+
+async def test_restart_invalidation_succeeds_even_when_docker_unavailable(access_manager):
+    conversation_manager, access_service = access_manager
+    conversation_manager.sandbox_service.reconcile.side_effect = RuntimeError("docker unavailable")
+    await conversation_manager.start()
+    access_service.invalidate_outstanding.assert_awaited_once()
+    assert not conversation_manager.needs_access_invalidation
+    assert conversation_manager.needs_cleanup
+
+
+async def test_cancelled_issuance_request_remains_owned_by_manager(access_manager):
+    conversation_manager, access_service = access_manager
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_issue = access_service.issue
+
+    async def issue(*args):
+        entered.set()
+        await release.wait()
+        return await original_issue(*args)
+
+    access_service.issue = issue
+    submitting = asyncio.create_task(conversation_manager.submit("alice", "one"))
+    await entered.wait()
+    submitting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submitting
+    release.set()
+    await asyncio.gather(*conversation_manager.background_tasks)
+    conversation = conversation_manager.get("alice")
+    assert conversation.access_token_id == "grant-id"
+    assert conversation.claude_process.prompts == ["one"]
+    assert not access_service.revoked
+
+
+async def test_cancelled_reset_does_not_cancel_grant_revocation(access_manager):
+    conversation_manager, access_service = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_revoke = access_service.revoke_conversation
+
+    async def revoke(conversation_id):
+        entered.set()
+        await release.wait()
+        return await original_revoke(conversation_id)
+
+    access_service.revoke_conversation = revoke
+    resetting = asyncio.create_task(conversation_manager.reset("alice"))
+    await entered.wait()
+    assert conversation.is_retired and not conversation.claude_process.is_closed
+    resetting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resetting
+    release.set()
+    await conversation_manager.close()
+    assert access_service.revoked == [conversation.conversation_id]
+    assert conversation.claude_process.is_closed
+
+
+async def test_idle_retirement_revokes_grant(access_manager):
+    conversation_manager, access_service = access_manager
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    conversation.claude_process.finish()
+    conversation.last_activity_monotonic = 0
+    await conversation_manager.sweep_once()
+    assert access_service.revoked == [conversation.conversation_id]
+    assert conversation.claude_process.is_closed and conversation.is_retired
+
+
+async def test_real_transport_waits_for_revocation_before_process_cleanup():
+    stream = FakeStream()
+    service = SimpleNamespace(
+        exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)),
+        run=AsyncMock(return_value=sandbox.ExecResult(0, "")),
+    )
+    failed = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def revoke_access():
+        assert failed == ["The assistant conversation ended. Start a new conversation."]
+        entered.set()
+        await release.wait()
+
+    process = await chat.ClaudeProcess.create(
+        "test", lambda message: None, failed.append, service, fake_handle(),
+        before_close=revoke_access,
+    )
+    stream.messages.put_nowait(None)
+    await entered.wait()
+    assert process.is_closed and stream.closed == 0
+    assert service.run.await_count == 1  # Only process readiness has run.
+    release.set()
+    await process.close()
+    assert stream.closed == 1 and service.run.await_count == 2
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_real_startup_failure_waits_for_revocation_before_cleanup(cancel):
+    stream = FakeStream()
+    ready_entered, revocation_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    commands = []
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        if "kill -TERM" in command:
+            return sandbox.ExecResult(0, "")
+        ready_entered.set()
+        if cancel:
+            await asyncio.Future()
+        return sandbox.ExecResult(1, "")
+
+    async def revoke_access():
+        revocation_entered.set()
+        await release.wait()
+
+    service = SimpleNamespace(
+        exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)), run=run,
+    )
+    starting = asyncio.create_task(chat.ClaudeProcess.create(
+        "test", lambda message: None, lambda message: None, service, fake_handle(),
+        before_close=revoke_access,
+    ))
+    await ready_entered.wait()
+    if cancel:
+        starting.cancel()
+    await revocation_entered.wait()
+    assert stream.closed == 0 and len(commands) == 1
+    release.set()
+    with pytest.raises(asyncio.CancelledError if cancel else sandbox.SandboxError):
+        await starting
+    assert stream.closed == 1 and "kill -TERM" in commands[-1]
+
+
+async def test_real_process_cleanup_proceeds_when_revocation_hook_fails():
+    stream = FakeStream()
+    service = SimpleNamespace(
+        exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)),
+        run=AsyncMock(return_value=sandbox.ExecResult(0, "")),
+    )
+    revoke_access = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    process = await chat.ClaudeProcess.create(
+        "test", lambda message: None, lambda message: None, service, fake_handle(),
+        before_close=revoke_access,
+    )
+    await process.close()
+    revoke_access.assert_awaited_once()
+    assert stream.closed == 1 and service.run.await_count == 2
+
+
+@pytest.mark.parametrize("startup_failure", [False, True])
+async def test_manager_wires_revocation_into_real_process_cleanup(access_manager, startup_failure):
+    conversation_manager, access_service = access_manager
+    conversation_manager.process_factory = chat.ClaudeProcess
+    stream = FakeStream()
+    commands = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_revoke = access_service.revoke_conversation
+
+    async def revoke_access(conversation_id):
+        entered.set()
+        await release.wait()
+        return await original_revoke(conversation_id)
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        if "kill -TERM" in command or not startup_failure:
+            return sandbox.ExecResult(0, "")
+        return sandbox.ExecResult(1, "")
+
+    access_service.revoke_conversation = revoke_access
+    conversation_manager.sandbox_service.exec = AsyncMock(
+        return_value=SimpleNamespace(start=lambda: stream),
+    )
+    conversation_manager.sandbox_service.run = run
+    submitting = asyncio.create_task(conversation_manager.submit("alice", "one"))
+    if not startup_failure:
+        await submitting
+        stream.messages.put_nowait(None)
+    await entered.wait()
+    conversation = conversation_manager.get("alice")
+    assert conversation_manager.resolve_live_assignment(
+        "alice", conversation.conversation_id, conversation.sandbox_handle.container_id,
+    ) is None
+    assert stream.closed == 0
+    assert not any("kill -TERM" in command for command in commands)
+    release.set()
+    if startup_failure:
+        with pytest.raises(ChatError, match="unavailable"):
+            await submitting
+    else:
+        await conversation.cleanup_task
+    assert conversation.conversation_id in access_service.revoked
+    assert stream.closed == 1
+    assert any("kill -TERM" in command for command in commands)
