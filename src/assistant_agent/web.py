@@ -27,6 +27,7 @@ from assistant_agent.chat import ChatError, Conversation, ConversationManager
 from assistant_agent.config import ConfigError, SCOPES, TEMPLATES_DIR, get_settings
 from assistant_agent.google_oauth import account_identity, authorization_url, exchange_code, revoke
 from assistant_agent.web_store import WebStore
+from assistant_agent.gmail_service import GmailService
 
 logger = logging.getLogger(__name__)
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise ConfigError("Web app requires DATABASE_URL and CREDENTIAL_ENCRYPTION_KEY.")
     engine = make_async_engine(settings.database_url)
     chat = None
+    gmail = None
     sandbox = Sandbox()
     try:
         app.state.settings = settings
@@ -49,6 +51,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings.credential_encryption_key,
             app.state.google_worker,
         )
+        gmail = GmailService(app.state.store)
+        app.state.gmail = gmail
         app.state.sandbox = sandbox
         chat = ConversationManager(service=sandbox)
         app.state.chat = chat
@@ -64,7 +68,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 try:
                     await sandbox.close()
                 finally:
-                    await engine.dispose()
+                    try:
+                        if gmail is not None:
+                            await gmail.aclose()
+                    finally:
+                        await engine.dispose()
 
 
 def create_app() -> FastAPI:

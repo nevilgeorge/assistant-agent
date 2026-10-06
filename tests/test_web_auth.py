@@ -536,6 +536,8 @@ async def test_failed_startup_closes_chat_and_disposes_engine(web, monkeypatch):
         async with application.router.lifespan_context(application):
             pytest.fail("Failed startup must not yield")
     assert close.is_set()
+    assert application.state.gmail._closed
+    assert application.state.gmail.worker is application.state.google_worker
     dispose.assert_awaited_once()
 
 
@@ -556,6 +558,7 @@ async def test_shutdown_disposes_engine_even_if_chat_close_fails(web, monkeypatc
         async with application.router.lifespan_context(application):
             pass
     dispose.assert_awaited_once()
+    assert application.state.gmail._closed
 
 
 async def test_postgres_async_driver_transactions_and_disposal(web):
