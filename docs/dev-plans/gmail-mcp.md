@@ -1,6 +1,6 @@
 # Gmail MCP and session file access
 
-Status: Phase 1 Gmail service implemented; MCP and sandbox integration remain proposed. Last updated: 2026-10-06.
+Status: Phases 1–4 implemented; Claude registration and integrated validation remain pending. Last updated: 2026-10-06.
 
 ## Decision and scope
 
@@ -34,7 +34,7 @@ Use the existing `gmail.readonly` scope and authenticated `userId=me` for all ca
 | `download_emails` | Fetch each selected ID through `messages.get`: `full` for normalized text/JSON, `raw` for EML; write files and return paths. |
 | `download_attachment` | `GET /users/me/messages/{messageId}/attachments/{attachmentId}`; decode base64url bytes and write the file. |
 
-`messages.list` returns only message/thread IDs, with no preview or relevance score. Bound search to one page per call: default 20 messages, maximum 50, and no automatic next-page fetch. Retrieve selected headers (`From`, `To`, `Subject`, `Date`) and a bounded snippet for those hits. Return a query-bound continuation cursor, estimated total, and explicit metadata failures; narrow broad queries before paging further.
+`messages.list` returns only message/thread IDs, with no preview or relevance score. Bound search to one page per call: default 50 messages, maximum 50, and no automatic next-page fetch. Retrieve selected headers (`From`, `To`, `Subject`, `Date`) and a bounded snippet for those hits. Return a query-bound continuation cursor, estimated total, and explicit metadata failures; narrow broad queries before paging further.
 
 Fetch metadata concurrently with an initial limit of five in-flight Gmail requests per user shared across tools, plus an app-wide cap; run synchronous SDK calls through bounded workers with separate thread-owned transports and refresh credentials before fan-out. Start with individual requests, connection reuse, and a 15-second search work deadline including bounded retries with backoff/jitter. Stop scheduling new requests/retries at the deadline and drain active worker calls before returning; this is not a strict response-time limit. Apply rate/quota controls separately from concurrency, preserve listing order, and return partial failures explicitly. Defer HTTP batching until measurements justify it.
 
@@ -106,7 +106,7 @@ Direct HTTP is the simplest supported transport. A reverse proxy on separate san
 
 ## Development Plan
 
-Use each phase below as the scope for a separate Codex implementation plan. Phases 1–3 are implemented; phases 4–6 are pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4. Keep agent tools disabled until phase 5.
+Use each phase below as the scope for a separate Codex implementation plan. Phases 1–4 are implemented; phases 5–6 are pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4. Keep agent tools disabled until phase 5.
 
 | Phase | Design sections |
 | --- | --- |
@@ -178,6 +178,63 @@ routes, downloads, Claude bearer environment, or tool activation are included.
 - Add `gmail_mcp.py` with the official Python SDK's Streamable HTTP ASGI integration and FastAPI lifespan. Expose the five tools at `/mcp/gmail`, authenticating and authorizing every request through phase 3.
 - Add `session_files.py` for text/JSON/EML and attachment materialization. Use server-generated per-call directories, atomic publication, byte limits, safe filenames, and explicit per-item outcomes. Fetch again on each call; preserve prior downloads.
 - **Complete when:** HTTP MCP tests cover discovery and all tool contracts, unauthorized calls, path traversal, download limits, partial failures, and repeated downloads. Retrieval-only tools create no sandbox files; credentials and output paths come only from the authenticated grant.
+
+Implemented in `gmail_mcp.py` and `session_files.py`, using the official Python
+MCP SDK v2 with stateless Streamable HTTP and JSON responses at `/mcp/gmail`.
+Standard HTTP middleware authenticates every request, including initialization and
+discovery, through `SandboxAccessService.authenticate()`. Each tool independently
+reauthorizes its grant and server-owned tool permission. The FastAPI lifespan
+owns the SDK session manager through a dedicated task so its AnyIO scopes start
+and stop in the same task. Host/Origin validation remains enabled; browser cookies
+do not authorize MCP.
+
+`GmailMCP` takes explicit typed Gmail, session-file, and access services, a live
+assignment resolver, and the configured base URL. The web lifespan constructs
+it after its dependencies and installs its HTTP app into a pre-registered mount;
+shutdown restores an unavailable response. MCP code does not access FastAPI
+application state or global settings.
+
+`search_emails` defaults to 50 messages in both interfaces. Full retrievals
+preserve phase 1's normalized dataclasses and incomplete-result indicators.
+Raw retrieval returns exact base64url MIME with encoding and decoded byte count;
+results exceeding the 1 MiB compact tool-payload budget fail with guidance to
+download EML. The SDK protocol envelope is additional to that payload budget.
+Retrieval-only tools create no files.
+
+Downloads fetch each explicit call anew and return ordered item outcomes,
+published bytes, paths, retryability, and truncation/body-part warnings. Text
+and JSON downloads preserve useful incomplete content with explicit warnings;
+EML and attachment bytes are unchanged. Attachments use generated `.bin` names
+and `application/octet-stream`, without an extra message metadata fetch.
+Each call stages privately on the existing session filesystem and atomically
+publishes a fresh UUID directory, with sandbox-readable modes and paths under
+`/input`. IDs and original names never select filesystem paths. Directory-FD
+operations reject symlinks, including mount ancestors. Earlier downloads remain.
+
+Constructor-configurable defaults:
+
+| Limit | Default |
+| --- | --- |
+| HTTP request body | 64 KiB |
+| Compact serialized tool payload | 1 MiB |
+| Authenticated HTTP requests | 60/minute per conversation |
+| Active tool calls | 2 per conversation; 8 app-wide |
+| Download message count | 50/call |
+| Binary file | 32 MiB |
+| Published file bytes | 64 MiB/call; 256 MiB/conversation |
+| Download scheduling budget | 120 seconds, then drain active work |
+
+Downloads serialize within a conversation and process items sequentially to
+bound memory and quota races. Quota failures are per item; unpublished files
+consume no retained quota. Cancellation drains filesystem workers before
+removing staging. Conversation cleanup revokes access, cancels/drains downloads,
+and only then destroys the sandbox and session directory; publication rechecks
+the grant immediately before atomic rename. Quota/task state is removed on
+retirement; conversation-ID tombstones remain until shutdown to reject stale
+contexts. Restart reconciliation removes abandoned session files as in phase 2.
+Tests cover HTTP contracts/authentication, real database grants, file quotas,
+safe publication, repeated downloads, partial failures, and cleanup races.
+Claude receives no bearer token or MCP configuration until phase 5.
 
 ### Phase 5 — Claude registration and permissions
 

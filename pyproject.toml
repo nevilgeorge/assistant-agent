@@ -24,6 +24,7 @@ dependencies = [
     "python-multipart>=0.0.20,<1",
     "sqlalchemy[asyncio]>=2.0,<3",
     "uvicorn[standard]>=0.54.0",
+    "mcp>=2,<3",
 ]
 
 [project.scripts]

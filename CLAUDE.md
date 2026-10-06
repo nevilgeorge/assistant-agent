@@ -24,3 +24,5 @@ Never put a provenance header on that `Dockerfile`: line 1 must stay
 ## Writing Python
 - Use type hints extensively
 - Use ruff for linting
+- Add descriptive yet concise docstrings for functions and classes
+- Use descriptive variable names that communicate purpose and type; prefer `conversation_manager`, `sandbox_service`, and `output_reader_task` over vague names such as `chat`, `service`, or `reader`.

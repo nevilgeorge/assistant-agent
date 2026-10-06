@@ -106,13 +106,23 @@ class SandboxAccessService:
         tool_name: str,
         live_assignment_resolver: LiveAssignmentResolver,
     ) -> AuthorizedSandboxContext:
-        """Authorize an allowed tool against an unexpired, live assignment.
+        """Authenticate a live grant and enforce the server-owned tool allowlist."""
+        if tool_name not in ALLOWED_TOOLS:
+            raise SandboxAuthorizationError()
+        return await self.authenticate(raw_token, live_assignment_resolver)
+
+    async def authenticate(
+        self,
+        raw_token: str | None,
+        live_assignment_resolver: LiveAssignmentResolver,
+    ) -> AuthorizedSandboxContext:
+        """Authenticate an unexpired, live assignment independently of a tool.
 
         Resolve trusted identities and input paths from the assignment, checking
         expiry and retirement again after database work. Invalid grants and
         backend or resolver failures raise a generic SandboxAuthorizationError.
         """
-        if not raw_token or tool_name not in ALLOWED_TOOLS or self._invalidation_pending:
+        if not raw_token or self._invalidation_pending:
             raise SandboxAuthorizationError()
         revocation_generation = self._revocation_generation
         try:

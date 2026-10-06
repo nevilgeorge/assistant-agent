@@ -69,6 +69,29 @@ def client_for(web):
     return client
 
 
+async def test_mcp_mount_uses_lifespan_dependencies_and_can_restart(web):
+    application = web.module.create_app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://localhost:8000"
+    ) as client:
+        assert (await client.post("/mcp/gmail")).status_code == 503
+        for _ in range(2):
+            async with application.router.lifespan_context(application):
+                state = application.state
+                assert state.gmail_mcp.gmail_service is state.gmail_service
+                assert state.gmail_mcp.session_files_service is state.session_files_service
+                assert state.gmail_mcp.access_service is state.sandbox_access_service
+                assert (
+                    state.gmail_mcp.resolve_live_assignment
+                    == state.conversation_manager.resolve_live_assignment
+                )
+                assert (await client.post("/mcp/gmail")).status_code == 401
+            assert (await client.post("/mcp/gmail")).status_code == 503
+        assert sum(
+            getattr(route, "name", None) == "gmail_mcp" for route in application.routes
+        ) == 1
+
+
 def credentials():
     return Credentials(
         token="access",

@@ -536,7 +536,7 @@ class GmailService:
         self,
         user_id: str,
         query: str,
-        page_size: int = 20,
+        page_size: int = 50,
         cursor: str | None = None,
     ) -> SearchResult:
         if type(page_size) is not int or not 1 <= page_size <= 50 or not isinstance(query, str):

@@ -90,6 +90,28 @@ async def test_each_documented_tool_allowed(grants, tool_name):
     await grants.service.authorize(grants.issued.raw_token, tool_name, grants.resolver)
 
 
+async def test_authenticate_resolves_trusted_context_without_tool(grants):
+    authenticated_context = await grants.service.authenticate(grants.issued.raw_token, grants.resolver)
+    authorized_context = await grants.service.authorize(
+        grants.issued.raw_token, "search_emails", grants.resolver
+    )
+    assert authenticated_context == authorized_context
+
+
+@pytest.mark.parametrize("raw_token", [None, "", "unknown"])
+async def test_authenticate_missing_or_unknown_grant_denied(grants, raw_token):
+    with pytest.raises(SandboxAuthorizationError, match="Sandbox access denied"):
+        await grants.service.authenticate(raw_token, grants.resolver)
+
+
+async def test_authenticate_revoked_and_inactive_grants_denied(grants):
+    with pytest.raises(SandboxAuthorizationError):
+        await grants.service.authenticate(grants.issued.raw_token, lambda *args: None)
+    await grants.service.revoke_conversation(grants.handle.conversation_id)
+    with pytest.raises(SandboxAuthorizationError):
+        await grants.service.authenticate(grants.issued.raw_token, grants.resolver)
+
+
 @pytest.mark.parametrize("raw_token", [None, "", "unknown"])
 async def test_missing_and_unknown_tokens(grants, raw_token):
     with pytest.raises(SandboxAuthorizationError, match="Sandbox access denied"):

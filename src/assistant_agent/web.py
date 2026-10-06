@@ -18,6 +18,7 @@ from anyio import CancelScope
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+from starlette.routing import Mount
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -30,6 +31,8 @@ from assistant_agent.config import ConfigError, SCOPES, Settings, TEMPLATES_DIR,
 from assistant_agent.google_oauth import account_identity, authorization_url, exchange_code, revoke
 from assistant_agent.web_store import WebStore
 from assistant_agent.gmail_service import GmailService
+from assistant_agent.gmail_mcp import GmailMCP
+from assistant_agent.session_files import SessionFilesService
 from assistant_agent.web_dependencies import (
     get_application_settings,
     get_conversation_manager,
@@ -51,6 +54,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = make_async_engine(settings.database_url)
     conversation_manager = None
     gmail_service = None
+    session_files_service = None
     account_cleanup_tasks: set[asyncio.Task[None]] = set()
     app.state.account_cleanup_tasks = account_cleanup_tasks
     sandbox_service = Sandbox()
@@ -63,19 +67,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             google_worker,
         )
         gmail_service = GmailService(web_store)
+        session_files_service = SessionFilesService(gmail_service)
         sandbox_access_service = SandboxAccessService(session_factory)
         conversation_manager = ConversationManager(
-            service=sandbox_service, access_service=sandbox_access_service
+            service=sandbox_service, access_service=sandbox_access_service,
+            session_files_service=session_files_service,
         )
         app.state.settings = settings
         app.state.google_worker = google_worker
         app.state.web_store = web_store
         app.state.gmail_service = gmail_service
+        app.state.session_files_service = session_files_service
         app.state.sandbox_service = sandbox_service
         app.state.sandbox_access_service = sandbox_access_service
         app.state.conversation_manager = conversation_manager
         await conversation_manager.start()
-        yield
+        gmail_mcp = GmailMCP(
+            gmail_service=gmail_service,
+            session_files_service=session_files_service,
+            access_service=sandbox_access_service,
+            resolve_live_assignment=conversation_manager.resolve_live_assignment,
+            base_url=settings.base_url,
+        )
+        app.state.gmail_mcp = gmail_mcp
+        mcp_mount = app.state.gmail_mcp_mount
+        unavailable_app = mcp_mount.app
+        async with gmail_mcp.run():
+            mcp_mount.app = gmail_mcp.http_app
+            try:
+                yield
+            finally:
+                mcp_mount.app = unavailable_app
     finally:
         # Cleanup also runs if startup fails or the lifespan is cancelled.
         with CancelScope(shield=True):
@@ -89,8 +111,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await sandbox_service.close()
                 finally:
                     try:
-                        if gmail_service is not None:
-                            await gmail_service.aclose()
+                        try:
+                            if session_files_service is not None:
+                                await session_files_service.aclose()
+                        finally:
+                            if gmail_service is not None:
+                                await gmail_service.aclose()
                     finally:
                         await engine.dispose()
 
@@ -98,6 +124,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     application = FastAPI(title="assistant-agent", lifespan=lifespan)
     application.include_router(router)
+    # Register once; lifespan installs the MCP app after constructing its dependencies.
+    mcp_mount = Mount(
+        "/mcp", app=JSONResponse({"error": "MCP unavailable"}, status_code=503), name="gmail_mcp"
+    )
+    application.router.routes.append(mcp_mount)
+    application.state.gmail_mcp_mount = mcp_mount
     application.mount("/static", StaticFiles(directory=TEMPLATES_DIR.parent / "static"), name="static")
     return application
 

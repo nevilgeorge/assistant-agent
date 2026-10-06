@@ -744,9 +744,57 @@ async def test_failed_revocation_does_not_prevent_cleanup_and_sweeper_retries(ac
     access_service.retry_failed_revocations.assert_awaited_once()
 
 
+@pytest.mark.parametrize("revocation_fails", [False, True])
+@pytest.mark.parametrize("retirement", ["reset", "failure", "shutdown", "disconnect", "expiry"])
+async def test_download_retirement_drained_before_assignment_cleanup(
+    access_manager, revocation_fails, retirement,
+):
+    conversation_manager, access_service = access_manager
+    retirement_started = asyncio.Event()
+    downloads_drained = asyncio.Event()
+
+    async def retire_files(conversation_id):
+        assert conversation_id == conversation.conversation_id
+        assert conversation_manager.resolve_live_assignment(
+            "alice", conversation_id, conversation.sandbox_handle.container_id,
+        ) is None
+        if not revocation_fails:
+            assert conversation_id in access_service.revoked
+        retirement_started.set()
+        await downloads_drained.wait()
+
+    conversation_manager.session_files_service = SimpleNamespace(retire=AsyncMock(side_effect=retire_files))
+    await conversation_manager.submit("alice", "one")
+    conversation = conversation_manager.get("alice")
+    if revocation_fails:
+        access_service.revoke_conversation = AsyncMock(side_effect=RuntimeError("unavailable"))
+    if retirement == "reset":
+        cleanup_task = asyncio.create_task(conversation_manager.reset("alice"))
+    elif retirement == "shutdown":
+        cleanup_task = asyncio.create_task(conversation_manager.close())
+    elif retirement == "disconnect":
+        conversation_manager.block_user("alice")
+        cleanup_task = asyncio.create_task(conversation_manager.reset("alice"))
+    elif retirement == "expiry":
+        conversation.access_token_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        cleanup_task = asyncio.create_task(conversation_manager.sweep_once())
+    else:
+        conversation.fail("process failed")
+        cleanup_task = conversation.cleanup_task
+    await retirement_started.wait()
+    assert not conversation.claude_process.is_closed
+    assert not conversation_manager.sandbox_service.destroyed
+    downloads_drained.set()
+    await cleanup_task
+    assert conversation.claude_process.is_closed
+    assert conversation_manager.sandbox_service.destroyed == [conversation.sandbox_handle]
+    conversation_manager.session_files_service.retire.assert_awaited_once_with(conversation.conversation_id)
+
+
 @pytest.mark.parametrize("failure_stage", ["issue", "process"])
 async def test_access_issue_and_process_failures_revoke_and_destroy(access_manager, failure_stage):
     conversation_manager, access_service = access_manager
+    conversation_manager.session_files_service = SimpleNamespace(retire=AsyncMock())
     if failure_stage == "issue":
         access_service.issue = AsyncMock(side_effect=RuntimeError("database unavailable"))
     else:
@@ -759,6 +807,7 @@ async def test_access_issue_and_process_failures_revoke_and_destroy(access_manag
     assert access_service.revoked == [conversation.conversation_id]
     assert conversation.has_failed and not conversation.is_starting
     assert conversation_manager.sandbox_service.destroyed == [conversation.sandbox_handle]
+    conversation_manager.session_files_service.retire.assert_awaited_once_with(conversation.conversation_id)
 
 
 @pytest.mark.parametrize("retirement", ["reset", "shutdown", "disconnect"])

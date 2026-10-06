@@ -17,6 +17,7 @@ from .claude_process import ClaudeProcess
 
 if TYPE_CHECKING:
     from assistant_agent.sandbox_access import SandboxAccessService
+    from assistant_agent.session_files import SessionFilesService
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class Conversation:
         sandbox_service: sandbox.Sandbox,
         track_background_task: Callable[[Awaitable[None]], asyncio.Task[None]],
         sandbox_access_service: SandboxAccessService | None = None,
+        session_files_service: SessionFilesService | None = None,
     ) -> None:
         """Initialize an empty conversation and its turn and replay state."""
         self.user_id: str = user_id
@@ -60,6 +62,7 @@ class Conversation:
         self.cleanup_task: asyncio.Task[None] | None = None
         self.is_retired: bool = False
         self.sandbox_access_service: SandboxAccessService | None = sandbox_access_service
+        self.session_files_service: SessionFilesService | None = session_files_service
         self.access_token_id: str | None = None
         self.access_token_expires_at: datetime | None = None
 
@@ -71,12 +74,15 @@ class Conversation:
         )
 
     async def revoke_access(self) -> None:
-        """Attempt revocation before cleanup; the service retains failed retries."""
-        if self.sandbox_access_service is not None:
-            try:
+        """Revoke grants and drain file work before any assignment cleanup."""
+        try:
+            if self.sandbox_access_service is not None:
                 await self.sandbox_access_service.revoke_conversation(self.conversation_id)
-            except Exception:
-                logger.warning("Conversation access revocation pending for %s", self.conversation_id)
+        except Exception:
+            logger.warning("Conversation access revocation pending for %s", self.conversation_id)
+        finally:
+            if self.session_files_service is not None:
+                await self.session_files_service.retire(self.conversation_id)
 
     def emit(self, kind: str, **data: Any) -> None:
         """Add a sequenced event to the bounded replay buffer."""

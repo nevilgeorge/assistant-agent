@@ -19,6 +19,7 @@ from .conversation import Conversation
 
 if TYPE_CHECKING:
     from assistant_agent.sandbox_access import SandboxAccessService
+    from assistant_agent.session_files import SessionFilesService
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,14 @@ class ConversationManager:
     def __init__(
         self, process_factory=ClaudeProcess, service: sandbox.Sandbox | None = None,
         access_service: SandboxAccessService | None = None,
+        session_files_service: SessionFilesService | None = None,
     ) -> None:
         """Initialize conversation limits, task tracking, and sandbox ownership."""
         self.process_factory = process_factory
         self.sandbox_service = service if service is not None else sandbox.Sandbox()
         self.owns_sandbox_service = service is None
         self.access_service = access_service
+        self.session_files_service = session_files_service
         self.needs_access_invalidation = access_service is not None
         self.conversations = {}
         self.blocked_users: set[str] = set()
@@ -142,6 +145,7 @@ class ConversationManager:
                 raise ChatError("All conversation slots are busy. Try again later.", 503)
             self.conversations[user] = Conversation(
                 user, self.sandbox_service, self._track, self.access_service,
+                self.session_files_service,
             )
         return self.conversations[user]
 
@@ -229,7 +233,7 @@ class ConversationManager:
                 async with asyncio.timeout(constants.STARTUP_SECONDS):
                     process_options = (
                         {"before_close": conversation.revoke_access}
-                        if self.access_service is not None else {}
+                        if self.access_service is not None or self.session_files_service is not None else {}
                     )
                     process = await self.process_factory.create(
                         conversation.conversation_id, conversation.receive, conversation.fail, self.sandbox_service,
