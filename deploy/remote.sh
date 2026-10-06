@@ -16,11 +16,10 @@ uuid=$(blkid -s UUID -o value "$device")
 if ! grep -q "UUID=$uuid " /etc/fstab; then echo "UUID=$uuid /srv/assistant-agent ext4 defaults,nofail 0 2" >> /etc/fstab; fi
 mkdir -p /srv/assistant-agent/postgres /srv/assistant-agent/caddy-data /srv/assistant-agent/caddy-config
 chmod 700 /srv/assistant-agent/postgres /srv/assistant-agent/caddy-data
-# The sandbox runs as uid 1000 (the base image's `node` user, renamed to `agent`) and drops
-# all capabilities, so it cannot chown its own bind mount. Do it from the host.
-mkdir -p /srv/assistant-agent/sandboxes/1
-chown -R 1000:1000 /srv/assistant-agent/sandboxes
-chmod 700 /srv/assistant-agent/sandboxes/1
+# Session storage holds downloaded input, not persistent conversation workspaces.
+mkdir -p /srv/assistant-agent/session-inputs
+chown 10001:10001 /srv/assistant-agent/session-inputs
+chmod 700 /srv/assistant-agent/session-inputs
 # Amazon Linux 2023 ships without swap. On a 4 GiB instance an agent's memory spike would
 # otherwise leave the kernel to pick an OOM victim, and PostgreSQL is a plausible pick.
 # The file lives on the root volume, not /srv/assistant-agent: that mount is `nofail`, so
@@ -71,9 +70,8 @@ docker compose --env-file .env run --rm --no-deps --user root --entrypoint sh db
   -c 'chown postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data'
 docker compose --env-file .env up -d --wait --wait-timeout 180 db
 docker compose --env-file .env run --rm app alembic upgrade head
-# The sandbox comes up after the app so that a sandbox failure cannot hold up the HTTPS
-# readiness check below, which is what gates the deploy's exit status.
-docker compose --env-file .env up -d app caddy sandbox-1
+# Retire the former Compose-managed sandbox as an orphan; old workspace files stay unused.
+docker compose --env-file .env up -d --remove-orphans app caddy
 for attempt in $(seq 1 30); do
   if curl -fsS "https://$DOMAIN/healthz" >/dev/null; then
     # Reclaim the untagged images left behind by this deploy. Dangling only: this never

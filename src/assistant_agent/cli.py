@@ -147,10 +147,12 @@ async def _sandbox_async(args: argparse.Namespace) -> int:
 
     try:
         if not args.command:
-            status = await health()
+            status = await health(name=args.container)
             print(json.dumps(status, indent=2))
             return 0 if status["ok"] else 1
-        result = await run(" ".join(args.command))
+        if not args.container:
+            raise SandboxError("Execution requires sandbox --container <id>.")
+        result = await run(" ".join(args.command), name=args.container)
     except SandboxError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -189,6 +191,7 @@ def main() -> None:
         "sandbox", help="run a command in the agent sandbox container (no command: report status)"
     )
     # REMAINDER so flags meant for the inner command are not parsed as ours.
+    sandbox.add_argument("--container", help="explicit sandbox container ID")
     sandbox.add_argument("command", nargs=argparse.REMAINDER, help="command to run inside the sandbox")
     sandbox.set_defaults(func=_sandbox)
 

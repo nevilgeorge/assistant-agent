@@ -43,7 +43,7 @@ Traverse MIME parts and decode bodies; externally stored body parts may also req
 ## Session lifecycle and files
 
 1. Authenticate the internal user and assign a dedicated sandbox to the conversation. Replace the current shared-user container model before exposing user tokens and files.
-2. Create `/srv/assistant-agent/sessions/<session-id>/input/` and mount it at `/input:ro`; keep scratch/output space separate at `/workspace`.
+2. Create `/srv/assistant-agent/session-inputs/<conversation-id>/` and mount it at `/input:ro`; keep scratch/output space separate at `/workspace`.
 3. Give the app writable access to the host session directory. Docker bind sources must use host paths, even when requested by the containerized app.
 4. Issue a conversation-scoped app token and launch Claude with the MCP configuration below. Check MCP discovery/readiness before reporting Gmail access as ready.
 5. Download tools write temporary files and atomically publish completed files. The running sandbox sees additions through its existing read-only bind mount; no remount or container recreation is needed.

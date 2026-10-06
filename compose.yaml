@@ -24,47 +24,38 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
       DATABASE_URL: postgresql+psycopg://assistant_agent:${POSTGRES_PASSWORD}@db:5432/assistant_agent
-      SANDBOX_CONTAINER: assistant-agent-sandbox-1
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-assistant-agent-sandbox:local}
+      SANDBOX_DEPLOYMENT_ID: ${SANDBOX_DEPLOYMENT_ID:-local}
+      SANDBOX_NETWORK: ${SANDBOX_NETWORK:-assistant-agent-local-sandboxes}
+      SANDBOX_HOST_INPUT_ROOT: ${SANDBOX_HOST_INPUT_ROOT:?Run deploy/local.sh to resolve the absolute session root}
+      SANDBOX_APP_INPUT_ROOT: /srv/assistant-agent/session-inputs
       CHAT_MAX_SESSIONS: ${CHAT_MAX_SESSIONS:-4}
       CHAT_IDLE_SECONDS: ${CHAT_IDLE_SECONDS:-1800}
-    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SANDBOX_HOST_INPUT_ROOT}:/srv/assistant-agent/session-inputs
+    networks:
+      default:
+      sandbox:
+        aliases: [app]
     # deploy/local.sh discovers this inside Docker, including Docker Desktop/OrbStack.
     group_add: ["${DOCKER_GID:-0}"]
     depends_on:
       db: {condition: service_healthy}
-      sandbox-1: {condition: service_healthy}
     ports: ["127.0.0.1:8000:8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
       interval: 5s
       timeout: 4s
       retries: 12
-  sandbox-1:
-    build:
-      context: ./src/assistant_agent/sandbox_kit
-      dockerfile: Dockerfile
-    container_name: assistant-agent-sandbox-1
-    hostname: sandbox-1
-    restart: unless-stopped
-    init: true
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
-    pids_limit: 2048
-    mem_limit: 2g
-    cpus: 1.0
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-    logging:
-      driver: json-file
-      options: {max-size: 10m, max-file: "3"}
-    command: ["bash", "-c", "touch /tmp/.sandbox-ready && exec sleep infinity"]
-    healthcheck:
-      test: ["CMD", "test", "-f", "/tmp/.sandbox-ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
 secrets:
   db_password:
     file: ./deploy/local-db-password.txt
 volumes:
   pgdata:
+
+networks:
+  sandbox:
+    name: ${SANDBOX_NETWORK:-assistant-agent-local-sandboxes}
+    driver: bridge

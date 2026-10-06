@@ -121,3 +121,39 @@ def client_config() -> dict:
             "redirect_uris": [settings.redirect_uri],
         }
     }
+
+
+@dataclass(frozen=True)
+class SandboxSettings:
+    """Docker daemon paths differ from the paths visible inside the app."""
+
+    image: str = "assistant-agent-sandbox:local"
+    deployment_id: str = "local"
+    network: str = "assistant-agent-local-sandboxes"
+    host_input_root: Path = DATA_DIR / "session-inputs"
+    app_input_root: Path = DATA_DIR / "session-inputs"
+
+    def __post_init__(self) -> None:
+        import re
+
+        for field in ("image", "network"):
+            value = getattr(self, field)
+            if not value or value != value.strip() or any(char.isspace() for char in value):
+                raise ConfigError(f"Sandbox {field} must be nonempty and contain no whitespace.")
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", self.deployment_id):
+            raise ConfigError("SANDBOX_DEPLOYMENT_ID must be a safe Docker name component.")
+        for field in ("host_input_root", "app_input_root"):
+            value = Path(getattr(self, field))
+            if not value.is_absolute() or ".." in value.parts or value == Path("/"):
+                raise ConfigError(f"Sandbox {field} must be an absolute non-root path.")
+            object.__setattr__(self, field, value)
+
+
+def get_sandbox_settings() -> SandboxSettings:
+    return SandboxSettings(
+        image=os.getenv("SANDBOX_IMAGE", "assistant-agent-sandbox:local"),
+        deployment_id=os.getenv("SANDBOX_DEPLOYMENT_ID", "local"),
+        network=os.getenv("SANDBOX_NETWORK", "assistant-agent-local-sandboxes"),
+        host_input_root=Path(os.getenv("SANDBOX_HOST_INPUT_ROOT", str(DATA_DIR / "session-inputs"))),
+        app_input_root=Path(os.getenv("SANDBOX_APP_INPUT_ROOT", str(DATA_DIR / "session-inputs"))),
+    )

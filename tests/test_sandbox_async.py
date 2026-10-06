@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import aiodocker
 from aiodocker.stream import Message
 
 from assistant_agent import chat, sandbox
@@ -47,13 +48,13 @@ async def test_command_collects_ordered_bytes_and_inspects_exit(monkeypatch, cod
         assert not clients  # no connection on construction
         if code is None:
             with pytest.raises(sandbox.SandboxError, match="exit status"):
-                await service.run("echo test")
+                await service.run("echo test", name="override")
         else:
             result = await service.run("echo test", name="override", workdir="/tmp")
             assert result == sandbox.ExecResult(code, "雪�")
         assert stream.closed == 1
         clients[0].containers.get.assert_awaited_with(
-            "override" if code is not None else sandbox.container_name()
+            "override"
         )
         args = container.exec.call_args.kwargs
         assert args == dict(
@@ -63,10 +64,11 @@ async def test_command_collects_ordered_bytes_and_inspects_exit(monkeypatch, cod
             tty=False,
             user="agent",
             workdir="/tmp" if code is not None else "/workspace",
+            environment=None,
         )
         # Interactive execs use another HTTP pool; repeat control calls reuse theirs.
-        await service.exec("read", stdin=True)
-        await service.exec("true")
+        await service.exec("read", stdin=True, name="override")
+        await service.exec("true", name="override")
         assert len(clients) == 2
     assert all(client.close.await_count == 1 for client in clients)
 
@@ -76,7 +78,7 @@ async def test_command_deadline_closes_stream():
     async with sandbox.Sandbox() as service:
         service.exec = AsyncMock(return_value=SimpleNamespace(start=lambda: stream))
         with pytest.raises(sandbox.SandboxError):
-            await service.run("hang", timeout=0.01)
+            await service.run("hang", name="test", timeout=0.01)
         assert stream.closed == 1
 
 
@@ -88,13 +90,15 @@ pytestmark_docker = pytest.mark.skipif(
 @pytestmark_docker
 async def test_docker_exit_codes_and_separate_interactive_streams():
     async with sandbox.Sandbox() as service:
-        result = await service.run("printf '\\377'; printf error >&2; exit 7")
+        handle = await service.allocate("test", uuid.uuid4().hex)
+        result = await service.run("printf '\\377'; printf error >&2; exit 7", name=handle.container_id)
         # Docker may deliver the two file descriptors in either order.
         assert result.exit_code == 7 and result.output in {"�error", "error�"}
         execution = await service.exec(
             'while IFS= read -r line; do printf "out:%s\\n" "$line"; '
             'printf "err:%s\\n" "$line" >&2; done',
             stdin=True,
+            name=handle.container_id,
         )
         async with execution.start() as stream:
             for text in ("first", "雪 second"):
@@ -139,20 +143,18 @@ for line in sys.stdin:
                     await asyncio.sleep(0.01)
             assert not conversation.failed and conversation.process is process
             assert conversation.transcript[-1]["text"] == "雪 second"
-            child = (await service.run(f"cat {shlex.quote(child_path)}")).output.strip()
+            handle = conversation.handle
+            child = (await service.run(f"cat {shlex.quote(child_path)}", name=handle.container_id)).output.strip()
             assert child.isdigit()
             await manager.reset("test")
-            assert process.reader.done() and process.closed
-            assert not (await process.execution.inspect())["Running"]
-            # A dead descendant can remain a zombie until the container's init reaps it.
-            state = await service.run(
-                f'test ! -e /proc/{child}/stat || test "$(cut -d " " -f 3 /proc/{child}/stat)" = Z'
-            )
-            assert state.ok
-            assert (await service.run(f"test ! -e {shlex.quote(process.path)}")).ok
+            assert process.output_reader_task.done() and process.is_closed
+            with pytest.raises(aiodocker.DockerError) as missing:
+                await service._client(sandbox.DockerClientRole.CONTROL).containers.get(handle.container_id)
+            assert missing.value.status == 404
+            assert not handle.app_input_path.exists()
         finally:
             await manager.close()
-            await service.run(f"rm -f {shlex.quote(child_path)}")
+
 
 
 async def test_failed_stream_open_releases_partial_attachment():
@@ -165,5 +167,58 @@ async def test_failed_stream_open_releases_partial_attachment():
     async with sandbox.Sandbox() as service:
         service.exec = AsyncMock(return_value=SimpleNamespace(start=lambda: stream))
         with pytest.raises(sandbox.SandboxError, match="attach failed"):
-            await service.run("true")
+            await service.run("true", name="test")
         assert stream.closed == 1
+
+
+@pytestmark_docker
+async def test_docker_input_publication_workspace_environment_and_inspection():
+    async with sandbox.Sandbox() as service:
+        handle = await service.allocate("input-test", uuid.uuid4().hex)
+        temporary = handle.app_input_path / "temporary"
+        published = handle.app_input_path / "published.txt"
+        temporary.write_text("atomic publication")
+        temporary.chmod(0o644)
+        temporary.replace(published)
+        result = await service.run(
+            'cat /input/published.txt; touch /workspace/writable; '
+            'if touch /input/forbidden 2>/dev/null; then exit 9; fi; '
+            'printf "\\n%s" "$PRIVATE_TEST_VALUE"',
+            name=handle.container_id,
+            environment={"PRIVATE_TEST_VALUE": "secret; $(touch /workspace/injected)"},
+        )
+        assert result.ok
+        assert result.output == "atomic publication\nsecret; $(touch /workspace/injected)"
+        assert (await service.run("test ! -e /workspace/injected", name=handle.container_id)).ok
+        container = await service._client(sandbox.DockerClientRole.CONTROL).containers.get(
+            handle.container_id
+        )
+        details = await container.show()
+        assert not any("PRIVATE_TEST_VALUE" in value for value in details["Config"]["Env"])
+        assert not any("GOOGLE" in value or "ANTHROPIC" in value
+                       for value in details["Config"]["Env"])
+        mounts = details["Mounts"]
+        assert len(mounts) == 1 and mounts[0]["Destination"] == "/input"
+        assert not mounts[0]["RW"] and mounts[0]["Source"] == str(handle.host_input_path)
+        host = details["HostConfig"]
+        assert host["PidsLimit"] == 2048 and host["Memory"] == 2 * 1024**3
+        assert host["NanoCpus"] == 1_000_000_000 and host["Init"]
+        assert host["CapDrop"] == ["ALL"]
+        assert host["SecurityOpt"] == ["no-new-privileges:true"]
+        assert host["RestartPolicy"]["Name"] == "no" and not host["PortBindings"]
+        assert list(details["NetworkSettings"]["Networks"]) == [service.settings.network]
+
+
+async def test_exec_environment_uses_docker_argument_without_shell_interpolation(monkeypatch, caplog):
+    class Container(dict):
+        exec = AsyncMock()
+    container = Container(State={"Status": "running"})
+    client = SimpleNamespace(containers=SimpleNamespace(get=AsyncMock(return_value=container)),
+                             close=AsyncMock())
+    monkeypatch.setattr(sandbox.aiodocker, "Docker", lambda **kwargs: client)
+    private = {"ANTHROPIC_API_KEY": "private; $(touch /workspace/injected)"}
+    async with sandbox.Sandbox() as service:
+        await service.exec("claude --version", name="chosen", environment=private)
+    assert container.exec.call_args.args == (["bash", "-lc", "claude --version"],)
+    assert container.exec.call_args.kwargs["environment"] is private
+    assert private["ANTHROPIC_API_KEY"] not in caplog.text

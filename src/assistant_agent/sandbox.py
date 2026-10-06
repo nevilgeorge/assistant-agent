@@ -1,20 +1,16 @@
-"""Run commands inside the agent sandbox container.
-
-`docker exec` is a call to the Docker daemon socket, not a connection to the container,
-so this works because deploy/compose.prod.yaml bind-mounts /var/run/docker.sock into the
-app container and adds the host's docker group to its supplementary groups. Being on a
-shared Compose network is neither necessary nor sufficient for it.
-
-That socket is root-equivalent control of the host, so keep this module narrow: it runs a
-command in one named, already-running container and returns what happened. It does not
-create, configure, or destroy containers -- the sandbox's lifecycle belongs to Compose.
-"""
+"""Dedicated, disposable Docker containers and loop-owned exec connections."""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import shlex
+import re
+import shutil
+from pathlib import Path
+from collections.abc import Mapping
+
+from .config import SandboxSettings, get_sandbox_settings
 from dataclasses import dataclass
 from enum import Enum
 
@@ -22,8 +18,11 @@ import aiodocker
 from aiohttp import ClientTimeout
 from aiodocker.execs import Exec
 
-DEFAULT_CONTAINER = "assistant-agent-sandbox-1"
-# The sandbox's WORKDIR, where the host's per-sandbox directory is bind-mounted.
+OWNER_LABEL = "assistant-agent.owner"
+DEPLOYMENT_LABEL = "assistant-agent.deployment"
+CONVERSATION_LABEL = "assistant-agent.conversation"
+ALLOCATION_TIMEOUT_SECONDS = 30
+# The writable, agent-owned workspace lives in the disposable container layer.
 WORKSPACE = "/workspace"
 REQUEST_TIMEOUT_SECONDS = 120
 
@@ -51,17 +50,35 @@ class ExecResult:
         return self.exit_code == 0
 
 
-def container_name() -> str:
-    """The container to exec into, overridable per deployment."""
-    return os.getenv("SANDBOX_CONTAINER", "").strip() or DEFAULT_CONTAINER
+@dataclass(frozen=True)
+class SandboxHandle:
+    container_id: str
+    user_id: str
+    conversation_id: str
+    host_input_path: Path
+    app_input_path: Path
 
 
 class Sandbox:
     """Loop-owned Docker connections, separate for control and chat attachments."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, settings: SandboxSettings | None = None, max_sessions: int | None = None
+    ) -> None:
+        self.settings = settings or get_sandbox_settings()
+        self.max_sessions = (
+            int(os.getenv("CHAT_MAX_SESSIONS", "4")) if max_sessions is None else max_sessions
+        )
+        if self.max_sessions < 1:
+            raise ValueError("Sandbox capacity must be positive.")
+        self._lock = asyncio.Lock()
+        self._assignments: dict[str, SandboxHandle] = {}
+        self._cleanup: dict[str, SandboxHandle] = {}
+        self._tasks: set[asyncio.Task] = set()
+        self._reconciled = False
         self._clients: dict[DockerClientRole, aiodocker.Docker] = {}
         self.closed = False
+        self._closing = False
 
     def _client(self, role: DockerClientRole) -> aiodocker.Docker:
         if self.closed:
@@ -75,15 +92,254 @@ class Sandbox:
                 raise SandboxError(f"Cannot reach the Docker daemon: {exc}") from exc
         return self._clients[role]
 
+    def _track(self, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        # Retrieve errors even when the requesting HTTP task is cancelled.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return task
+
+    @property
+    def capacity_used(self) -> int:
+        return len(self._assignments)
+
+    def _name(self, conversation_id: str) -> str:
+        return f"assistant-agent-{self.settings.deployment_id}-{conversation_id}"
+
+    def _session_path(self, conversation_id: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{32}", conversation_id):
+            raise SandboxError("Invalid generated conversation ID.")
+        root = self.settings.app_input_root
+        # Refuse symlinks at every existing level, including the configured root.
+        for path in (root, *root.parents):
+            if path.is_symlink():
+                raise SandboxError("Input root cannot contain symlinks.")
+        session = root / conversation_id
+        if session.is_symlink():
+            raise SandboxError("Input paths cannot be symlinks.")
+        return session
+
+    def _prepare_input(self, conversation_id: str) -> Path:
+        session = self._session_path(conversation_id)
+        root = self.settings.app_input_root
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+        session.mkdir(mode=0o755, exist_ok=False)
+        session.chmod(0o755)
+        return session
+
+    def _remove_input(self, conversation_id: str) -> None:
+        session = self._session_path(conversation_id)
+        if session.exists():
+            # No symlink anywhere in a generated directory is accepted for cleanup.
+            if any(path.is_symlink() for path in session.rglob("*")):
+                raise SandboxError("Refusing symlink in generated input directory.")
+            shutil.rmtree(session)
+
+    def _container_config(self, handle: SandboxHandle) -> dict:
+        return {
+            "Image": self.settings.image,
+            "Cmd": ["sleep", "infinity"],
+            "User": "agent",
+            "WorkingDir": WORKSPACE,
+            "Labels": {
+                OWNER_LABEL: "assistant-agent",
+                DEPLOYMENT_LABEL: self.settings.deployment_id,
+                CONVERSATION_LABEL: handle.conversation_id,
+            },
+            "HostConfig": {
+                "Binds": [f"{handle.host_input_path}:/input:ro"],
+                "Init": True,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges:true"],
+                "PidsLimit": 2048,
+                "Memory": 2 * 1024**3,
+                "NanoCpus": 1_000_000_000,
+                "RestartPolicy": {"Name": "no"},
+                "NetworkMode": self.settings.network,
+                "LogConfig": {"Type": "json-file", "Config": {"max-size": "10m", "max-file": "3"}},
+            },
+            "NetworkingConfig": {"EndpointsConfig": {self.settings.network: {}}},
+        }
+
+    async def _dependencies(self) -> None:
+        client = self._client(DockerClientRole.CONTROL)
+        await client.version()
+        await client.images.inspect(self.settings.image)
+        await client.networks.get(self.settings.network)
+
+    async def readiness(self, container_id: str) -> None:
+        result = await self.run("true", name=container_id, timeout=10)
+        if not result.ok:
+            raise SandboxError("Sandbox readiness command failed.")
+
+    async def allocate(self, user_id: str, conversation_id: str) -> SandboxHandle:
+        return await asyncio.shield(self._track(self._allocate_with_timeout(user_id, conversation_id)))
+
+    async def _allocate_with_timeout(self, user_id: str, conversation_id: str) -> SandboxHandle:
+        async with asyncio.timeout(ALLOCATION_TIMEOUT_SECONDS):
+            return await self._allocate(user_id, conversation_id)
+
+    async def _allocate(self, user_id: str, conversation_id: str) -> SandboxHandle:
+        async with self._lock:
+            if self.closed or self._closing:
+                raise SandboxError("Sandbox service is closing.")
+            if not self._reconciled:
+                await self._reconcile()
+            await self._retry_cleanup()
+            if self._cleanup:
+                raise SandboxError("Sandbox cleanup is incomplete; try again shortly.")
+            if self.capacity_used >= self.max_sessions:
+                raise SandboxError("All sandbox slots are in use.")
+            if conversation_id in self._assignments:
+                raise SandboxError("Conversation already has a sandbox assignment.")
+            name = self._name(conversation_id)
+            handle = SandboxHandle(
+                name, user_id, conversation_id,
+                self.settings.host_input_root / conversation_id,
+                self._session_path(conversation_id),
+            )
+            # Reserve before any create call, including an ambiguous daemon response.
+            self._assignments[conversation_id] = handle
+            try:
+                async with asyncio.timeout(ALLOCATION_TIMEOUT_SECONDS):
+                    await self._dependencies()
+                    self._prepare_input(conversation_id)
+                    container = await self._client(DockerClientRole.CONTROL).containers.create(
+                        self._container_config(handle), name=name
+                    )
+                    handle = SandboxHandle(
+                        container.id, user_id, conversation_id,
+                        handle.host_input_path, handle.app_input_path,
+                    )
+                    self._assignments[conversation_id] = handle
+                    await container.start()
+                    await self.readiness(handle.container_id)
+                return handle
+            except BaseException as exc:
+                self._cleanup[conversation_id] = handle
+                try:
+                    await self._destroy(handle)
+                except Exception:
+                    pass
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise SandboxError("Sandbox allocation failed.") from exc
+
+    async def destroy(self, handle: SandboxHandle) -> None:
+        await asyncio.shield(self._track(self._destroy_locked(handle)))
+
+    async def _destroy_locked(self, handle: SandboxHandle) -> None:
+        async with self._lock:
+            await self._destroy(handle)
+
+    async def _destroy(self, handle: SandboxHandle) -> None:
+        self._cleanup[handle.conversation_id] = handle
+        try:
+            client = self._client(DockerClientRole.CONTROL)
+            try:
+                container = await client.containers.get(handle.container_id)
+                labels = container["Config"]["Labels"] or {}
+                if (labels.get(OWNER_LABEL) != "assistant-agent"
+                        or labels.get(DEPLOYMENT_LABEL) != self.settings.deployment_id
+                        or labels.get(CONVERSATION_LABEL) != handle.conversation_id):
+                    raise SandboxError("Refusing to destroy a container outside this assignment.")
+                await container.delete(force=True)
+            except aiodocker.DockerError as exc:
+                if exc.status != 404:
+                    raise
+            self._remove_input(handle.conversation_id)
+        except Exception as exc:
+            raise SandboxError("Sandbox destruction incomplete; retained for retry.") from exc
+        self._cleanup.pop(handle.conversation_id, None)
+        self._assignments.pop(handle.conversation_id, None)
+
+    async def retry_cleanup(self) -> None:
+        await asyncio.shield(self._track(self._retry_locked()))
+
+    async def _retry_locked(self) -> None:
+        async with self._lock:
+            if not self._reconciled:
+                await self._reconcile()
+            await self._retry_cleanup()
+
+    async def _retry_cleanup(self) -> None:
+        for handle in list(self._cleanup.values()):
+            try:
+                await self._destroy(handle)
+            except SandboxError:
+                continue
+
+    async def reconcile(self) -> None:
+        await asyncio.shield(self._track(self._reconcile_locked()))
+
+    async def _reconcile_locked(self) -> None:
+        async with self._lock:
+            await self._reconcile()
+
+    async def _reconcile(self) -> None:
+        self._reconciled = False
+        try:
+            client = self._client(DockerClientRole.CONTROL)
+            containers = await client.containers.list(all=True, filters={"label": [
+                f"{OWNER_LABEL}=assistant-agent",
+            ]})
+            protected: set[str] = set()
+            for container in containers:
+                # Check labels ourselves as defense against an overly broad daemon response.
+                labels = container["Labels"]
+                if (labels.get(OWNER_LABEL) == "assistant-agent"
+                        and labels.get(DEPLOYMENT_LABEL) != self.settings.deployment_id):
+                    protected.add(labels.get(CONVERSATION_LABEL, ""))
+                if (labels.get(OWNER_LABEL) != "assistant-agent"
+                        or labels.get(DEPLOYMENT_LABEL) != self.settings.deployment_id):
+                    continue
+                conversation_id = labels.get(CONVERSATION_LABEL, "")
+                self._session_path(conversation_id)
+                handle = SandboxHandle(
+                    container.id, "", conversation_id,
+                    self.settings.host_input_root / conversation_id,
+                    self.settings.app_input_root / conversation_id,
+                )
+                self._assignments[conversation_id] = handle
+                await self._destroy(handle)
+            await self._retry_cleanup()
+            if self._cleanup:
+                raise SandboxError("Sandbox cleanup remains incomplete.")
+            root = self.settings.app_input_root
+            self._session_path("0" * 32)
+            if root.exists():
+                for path in root.iterdir():
+                    if re.fullmatch(r"[0-9a-f]{32}", path.name) and path.name not in protected:
+                        self._remove_input(path.name)
+            self._reconciled = True
+        except Exception as exc:
+            raise SandboxError("Docker reconciliation incomplete; allocation is blocked.") from exc
+
+    async def health(self, container_id: str | None = None) -> dict:
+        try:
+            await self._dependencies()
+            if container_id:
+                result = await self.run("claude --version", name=container_id)
+                return {"container": container_id, "ok": result.ok,
+                        "claude_version": result.output.strip()}
+            return {"ok": True, "image": self.settings.image, "network": self.settings.network}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     async def exec(
         self,
         command: str,
         *,
         stdin: bool = False,
         workdir: str = WORKSPACE,
-        name: str | None = None,
+        name: str,
+        environment: Mapping[str, str] | None = None,
     ) -> Exec:
-        target = name or container_name()
+        target = name
+        if not target:
+            raise SandboxError("An explicit sandbox container ID is required.")
         role = DockerClientRole.CHAT if stdin else DockerClientRole.CONTROL
         try:
             container = await self._client(role).containers.get(target)
@@ -101,6 +357,7 @@ class Sandbox:
                 tty=False,
                 user="agent",
                 workdir=workdir,
+                environment=environment,
             )
         except Exception as exc:
             raise SandboxError(f"Sandbox exec failed: {exc}") from exc
@@ -110,13 +367,14 @@ class Sandbox:
         command: str,
         *,
         workdir: str = WORKSPACE,
-        name: str | None = None,
+        name: str,
+        environment: Mapping[str, str] | None = None,
         timeout: float = REQUEST_TIMEOUT_SECONDS + 15,
     ) -> ExecResult:
         """Use a login shell so the image's CLI PATH is available."""
         try:
             async with asyncio.timeout(timeout):
-                execution = await self.exec(command, workdir=workdir, name=name)
+                execution = await self.exec(command, workdir=workdir, name=name, environment=environment)
                 chunks = []
                 stream = execution.start()
                 try:
@@ -136,6 +394,14 @@ class Sandbox:
             raise SandboxError(f"Sandbox exec failed: {exc}") from exc
 
     async def close(self) -> None:
+        self._closing = True
+        if self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        for handle in list(self._assignments.values()):
+            try:
+                await self.destroy(handle)
+            except SandboxError:
+                pass
         self.closed = True
         clients, self._clients = list(self._clients.values()), {}
         if clients:
@@ -164,12 +430,15 @@ async def run_argv(argv: list[str], **kwargs) -> ExecResult:
     return await run(shlex.join(argv), **kwargs)
 
 
-async def ask(message: str) -> ExecResult:
+async def ask(
+    message: str, *, name: str, environment: Mapping[str, str] | None = None
+) -> ExecResult:
     """Send one message to Claude and collect its plain-text response.
 
-    The shared sandbox has no per-user workspace isolation yet, so this mode gives
-    Claude no tools and saves no transcript in the container.
+    Legacy explicit-container commands expose no tools and save no transcript.
     """
+    if environment is None and (key := os.getenv("ANTHROPIC_API_KEY")):
+        environment = {"ANTHROPIC_API_KEY": key}
     return await run_argv(
         [
             "timeout",
@@ -188,20 +457,13 @@ async def ask(message: str) -> ExecResult:
             "mcp__*",
             "--",
             message,
-        ]
+        ],
+        name=name,
+        environment=environment,
     )
 
 
-async def health() -> dict:
-    """A small status dict for diagnostics: is the sandbox up and is the agent CLI there?"""
-    target = container_name()
-    try:
-        result = await run_argv(["claude", "--version"])
-    except SandboxError as exc:
-        return {"container": target, "ok": False, "error": str(exc)}
-    return {
-        "container": target,
-        "ok": result.ok,
-        "claude_version": result.output.strip() if result.ok else None,
-        "error": None if result.ok else result.output.strip(),
-    }
+async def health(name: str | None = None) -> dict:
+    """Check dependencies without allocating a container."""
+    async with Sandbox() as service:
+        return await service.health(name)

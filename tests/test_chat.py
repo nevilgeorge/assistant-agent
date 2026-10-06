@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,7 +9,35 @@ import pytest
 from aiodocker.stream import Message
 
 from assistant_agent import chat, sandbox
-from assistant_agent.chat import ChatError, ConversationManager
+from assistant_agent.chat import ChatError, ConversationManager, constants
+
+
+class FakeSandbox:
+    def __init__(self):
+        self.allocated = []
+        self.destroyed = []
+        self.reconcile = AsyncMock()
+        self.retry_cleanup = AsyncMock()
+        self.close = AsyncMock()
+
+    async def allocate(self, user_id, conversation_id):
+        handle = sandbox.SandboxHandle(
+            f"container-{conversation_id}", user_id, conversation_id,
+            Path("/host/session-inputs") / conversation_id,
+            Path("/app/session-inputs") / conversation_id,
+        )
+        self.allocated.append(handle)
+        return handle
+
+    async def destroy(self, handle):
+        self.destroyed.append(handle)
+
+
+def fake_handle():
+    return sandbox.SandboxHandle(
+        "test-container", "test-user", "test-conversation",
+        Path("/host/input"), Path("/app/input"),
+    )
 
 
 class FakeProcess:
@@ -16,17 +45,19 @@ class FakeProcess:
         self.receive = receive
         self.failed = failed
         self.prompts = []
-        self.closed = False
+        self.is_closed = False
 
     async def send(self, prompt):
         self.prompts.append(prompt)
 
     async def close(self):
-        self.closed = True
+        self.is_closed = True
 
     @classmethod
-    async def create(cls, token, receive, failed, service):
-        return cls(token, receive, failed)
+    async def create(cls, token, receive, failed, service, handle):
+        process = cls(token, receive, failed)
+        process.sandbox_handle = handle
+        return process
 
     def text(self, text):
         self.receive(
@@ -45,7 +76,7 @@ class FakeProcess:
 
 @pytest.fixture
 async def manager():
-    manager = ConversationManager(FakeProcess)
+    manager = ConversationManager(FakeProcess, service=FakeSandbox())
     yield manager
     await manager.close()
 
@@ -85,7 +116,7 @@ async def test_isolation_reset_failure_and_capacity(manager):
     old = manager.get("alice")
     old.process.failed("Ended")
     await old.teardown
-    assert old.process.closed and old.failed
+    assert old.process.is_closed and old.failed
     with pytest.raises(ChatError, match="new conversation"):
         await manager.submit("alice", "follow-up")
     await manager.reset("alice")
@@ -104,7 +135,7 @@ async def test_timeout_does_not_apply_to_later_turn(manager):
     assert not conversation.failed
     manager._timeout(conversation, conversation.active)
     await conversation.teardown
-    assert conversation.failed and conversation.process.closed
+    assert conversation.failed and conversation.process.is_closed
     assert conversation.events[-1]["type"] == "turn_failure"
 
 
@@ -114,7 +145,7 @@ async def test_limits_and_shutdown(manager):
     conversation.bytes = 2 * 1024 * 1024
     conversation.process.text("overflow")
     await conversation.teardown
-    assert conversation.failed and conversation.process.closed
+    assert conversation.failed and conversation.process.is_closed
     await manager.close()
     assert not manager.conversations
 
@@ -126,7 +157,7 @@ async def test_result_failure_retains_partial_output(manager):
     conversation.process.receive({"type": "result", "subtype": "error_max_turns", "is_error": True})
     await conversation.teardown
     assert conversation.snapshot()["transcript"][-1]["text"] == "partial"
-    assert conversation.failed and conversation.process.closed
+    assert conversation.failed and conversation.process.is_closed
 
 
 class Gate:
@@ -135,7 +166,7 @@ class Gate:
         self.release = asyncio.Event()
         self.made = []
 
-    async def create(self, token, receive, failed, service):
+    async def create(self, token, receive, failed, service, handle):
         self.entered.set()
         await self.release.wait()
         self.made.append(FakeProcess(token, receive, failed))
@@ -143,7 +174,7 @@ class Gate:
 
 
 async def test_spawn_does_not_block_other_callers(manager):
-    manager.factory = gate = Gate()
+    manager.process_factory = gate = Gate()
     task = asyncio.create_task(manager.submit("alice", "one"))
     await gate.entered.wait()
     conversation = manager.get("alice")
@@ -162,7 +193,7 @@ async def test_spawn_does_not_block_other_callers(manager):
 
 @pytest.mark.parametrize("shutdown", [False, True], ids=["reset", "shutdown"])
 async def test_reset_or_shutdown_during_spawn(manager, shutdown):
-    manager.factory = gate = Gate()
+    manager.process_factory = gate = Gate()
     task = asyncio.create_task(manager.submit("alice", "one"))
     await gate.entered.wait()
     conversation = manager.get("alice")
@@ -178,27 +209,27 @@ async def test_reset_or_shutdown_during_spawn(manager, shutdown):
     if shutdown:
         await closing
     assert exc.value.status == 503
-    assert gate.made[0].closed and gate.made[0].prompts == []
+    assert gate.made[0].is_closed and gate.made[0].prompts == []
     assert [e["type"] for e in conversation.events] == ["conversation_reset"]
     assert not conversation.starting and not conversation.active
 
 
 async def test_request_cancellation_preserves_reserved_submission(manager):
-    manager.factory = gate = Gate()
+    manager.process_factory = gate = Gate()
     task = asyncio.create_task(manager.submit("alice", "one"))
     await gate.entered.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     gate.release.set()
-    await asyncio.gather(*manager.work)
+    await asyncio.gather(*manager.background_tasks)
     conversation = manager.get("alice")
     assert conversation.process.prompts == ["one"] and not conversation.starting
-    assert not manager.work
+    assert not manager.background_tasks
 
 
 async def test_cancel_shutdown_still_joins_startup(manager):
-    manager.factory = gate = Gate()
+    manager.process_factory = gate = Gate()
     task = asyncio.create_task(manager.submit("alice", "one"))
     await gate.entered.wait()
     closing = asyncio.create_task(manager.close())
@@ -210,7 +241,7 @@ async def test_cancel_shutdown_still_joins_startup(manager):
     with pytest.raises(ChatError):
         await task
     await manager.close()
-    assert gate.made[0].closed and not manager.work
+    assert gate.made[0].is_closed and not manager.background_tasks
 
 
 async def test_transport_failure_during_spawn(manager):
@@ -218,23 +249,23 @@ async def test_transport_failure_during_spawn(manager):
 
     class Factory:
         @staticmethod
-        async def create(token, receive, failed, service):
+        async def create(token, receive, failed, service, handle):
             made.append(FakeProcess(token, receive, failed))
             failed("Ended")
             return made[-1]
 
-    manager.factory = Factory
+    manager.process_factory = Factory
     with pytest.raises(ChatError, match="conversation ended"):
         await manager.submit("alice", "one")
     conversation = manager.get("alice")
-    assert made[0].closed and not made[0].prompts
+    assert made[0].is_closed and not made[0].prompts
     assert [e["type"] for e in conversation.events] == ["turn_failure"]
     assert not conversation.starting
 
 
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
 async def test_spawn_failure_releases_reservation(manager, error):
-    manager.factory = SimpleNamespace(create=AsyncMock(side_effect=error()))
+    manager.process_factory = SimpleNamespace(create=AsyncMock(side_effect=error()))
     with pytest.raises(ChatError if error is RuntimeError else error):
         await manager.submit("alice", "one")
     conversation = manager.get("alice")
@@ -245,7 +276,7 @@ async def test_spawn_failure_releases_reservation(manager, error):
 async def test_cleanup_runs_once_before_any_spawn(manager, monkeypatch):
     order = []
 
-    async def cleanup(service):
+    async def cleanup():
         order.append("cleanup")
         await asyncio.sleep(0.01)
 
@@ -255,8 +286,8 @@ async def test_cleanup_runs_once_before_any_spawn(manager, monkeypatch):
             order.append("spawn")
             return await super().create(*args)
 
-    monkeypatch.setattr(chat, "cleanup_orphans", cleanup)
-    manager.factory = Factory
+    manager.sandbox_service.reconcile = cleanup
+    manager.process_factory = Factory
     manager.needs_cleanup = True
     await asyncio.gather(*(manager.submit(user, "one") for user in ("alice", "bob")))
     assert order == ["cleanup", "spawn", "spawn"] and not manager.needs_cleanup
@@ -264,16 +295,16 @@ async def test_cleanup_runs_once_before_any_spawn(manager, monkeypatch):
 
 async def test_failed_cleanup_blocks_spawn_and_is_retried(manager, monkeypatch):
     cleanup = AsyncMock(side_effect=RuntimeError("sandbox down"))
-    monkeypatch.setattr(chat, "cleanup_orphans", cleanup)
+    manager.sandbox_service.reconcile = cleanup
     factory = AsyncMock()
-    manager.factory = SimpleNamespace(create=factory)
+    manager.process_factory = SimpleNamespace(create=factory)
     manager.needs_cleanup = True
     with pytest.raises(ChatError, match="unavailable"):
         await manager.submit("alice", "one")
     assert manager.needs_cleanup and not factory.called
     await manager.reset("alice")
     cleanup.side_effect = None
-    manager.factory = FakeProcess
+    manager.process_factory = FakeProcess
     await manager.submit("alice", "two")
     assert cleanup.await_count == 2 and not manager.needs_cleanup
 
@@ -310,17 +341,18 @@ class FakeStream:
 
 
 @pytest.fixture
-async def transport():
+async def transport(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret-api-key")
     stream = FakeStream()
     service = SimpleNamespace(
         exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)),
         run=AsyncMock(return_value=sandbox.ExecResult(0, "")),
     )
     received, failures = [], []
-    process = await chat.ClaudeProcess.create("test", received.append, failures.append, service)
+    process = await chat.ClaudeProcess.create("test", received.append, failures.append, service, fake_handle())
     yield process, stream, service, received, failures
     await process.close()
-    assert process.reader.done() and stream.closed == 1
+    assert process.output_reader_task.done() and stream.closed == 1
 
 
 async def test_transport_reads_split_unicode_json_and_drains_stderr(transport):
@@ -365,7 +397,7 @@ async def test_send_failure_retains_partial_output_and_closes(manager):
     conversation.process.send = AsyncMock(side_effect=OSError("closed"))
     await manager.submit("alice", "two")
     await conversation.teardown
-    assert conversation.failed and conversation.process.closed
+    assert conversation.failed and conversation.process.is_closed
     assert conversation.transcript[1]["text"] == "partial"
 
 
@@ -386,7 +418,7 @@ async def test_startup_failure_or_cancellation_releases_attachment(cancel):
         exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)), run=readiness
     )
     task = asyncio.create_task(
-        chat.ClaudeProcess.create("test", lambda m: None, lambda m: None, service)
+        chat.ClaudeProcess.create("test", lambda m: None, lambda m: None, service, fake_handle())
     )
     await entered.wait()
     if cancel:
@@ -418,7 +450,7 @@ async def test_real_claude_multiple_turns():
         assert "cobalt" in conversation.transcript[-1]["text"].lower()
         assert any(e["type"] == "assistant_delta" for e in conversation.events)
         await manager.reset("integration")
-        assert process.closed
+        assert process.is_closed
         assert not (await process.execution.inspect())["Running"]
     finally:
         await manager.close()
@@ -434,7 +466,7 @@ async def test_shutdown_joins_cleanup_of_conversation_removed_by_sweeper(manager
     async def close():
         entered.set()
         await release.wait()
-        conversation.process.closed = True
+        conversation.process.is_closed = True
 
     conversation.process.close = close
     sweep = asyncio.create_task(manager.sweep_once())
@@ -447,12 +479,12 @@ async def test_shutdown_joins_cleanup_of_conversation_removed_by_sweeper(manager
     assert not closing.done()
     release.set()
     await closing
-    assert conversation.process.closed and not manager.work
+    assert conversation.process.is_closed and not manager.background_tasks
     assert conversation.timer.cancelled()
 
 
 async def test_startup_deadline_releases_stream(monkeypatch):
-    monkeypatch.setattr(chat, "STARTUP_SECONDS", 0.01)
+    monkeypatch.setattr(constants, "STARTUP_SECONDS", 0.01)
     stream = FakeStream()
 
     async def run(command, **kwargs):
@@ -464,17 +496,116 @@ async def test_startup_deadline_releases_stream(monkeypatch):
         exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)), run=run
     )
     with pytest.raises(TimeoutError):
-        await chat.ClaudeProcess.create("test", lambda m: None, lambda m: None, service)
+        await chat.ClaudeProcess.create("test", lambda m: None, lambda m: None, service, fake_handle())
     assert stream.closed == 1
 
 
 async def test_teardown_deadline_still_closes_stream(transport, monkeypatch):
     process, stream, service, received, failures = transport
-    monkeypatch.setattr(chat, "TEARDOWN_SECONDS", 0.01)
+    monkeypatch.setattr(constants, "TEARDOWN_SECONDS", 0.01)
 
     async def blocked(*args, **kwargs):
         await asyncio.Future()
 
     service.run = blocked
     await process.close()
-    assert stream.closed == 1 and process.reader.done()
+    assert stream.closed == 1 and process.output_reader_task.done()
+
+
+async def test_assignment_is_allocated_on_prompt_and_reused(manager):
+    alice = manager.get("alice")
+    assert not manager.sandbox_service.allocated
+    await manager.submit("alice", "one")
+    alice.process.finish()
+    await manager.submit("alice", "two")
+    await manager.submit("bob", "one")
+    assert len(manager.sandbox_service.allocated) == 2
+    first, second = manager.sandbox_service.allocated
+    assert first.user_id == "alice" and second.user_id == "bob"
+    assert first.conversation_id == alice.id
+    assert alice.process.sandbox_handle is first
+    assert manager.get("bob").process.sandbox_handle is second
+    assert first.container_id != second.container_id
+    assert first.host_input_path != second.host_input_path
+    assert first.app_input_path != second.app_input_path
+    await manager.reset("alice")
+    assert manager.sandbox_service.destroyed == [first]
+
+
+@pytest.mark.parametrize("retirement", ["reset", "shutdown"])
+async def test_retirement_during_allocation_destroys_unattached_handle(manager, retirement):
+    entered, release = asyncio.Event(), asyncio.Event()
+    allocate = manager.sandbox_service.allocate
+
+    async def blocked(user, conversation):
+        entered.set()
+        await release.wait()
+        return await allocate(user, conversation)
+
+    manager.sandbox_service.allocate = blocked
+    factory = AsyncMock()
+    manager.process_factory = SimpleNamespace(create=factory)
+    task = asyncio.create_task(manager.submit("alice", "one"))
+    await entered.wait()
+    if retirement == "reset":
+        await manager.reset("alice")
+        closing = None
+    else:
+        closing = asyncio.create_task(manager.close())
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(ChatError):
+        await task
+    if closing:
+        await closing
+    assert not factory.called
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+    assert len(manager.sandbox_service.destroyed) == 1
+
+
+async def test_cancelled_request_preserves_allocation(manager):
+    entered, release = asyncio.Event(), asyncio.Event()
+    allocate = manager.sandbox_service.allocate
+
+    async def blocked(user, conversation):
+        entered.set()
+        await release.wait()
+        return await allocate(user, conversation)
+
+    manager.sandbox_service.allocate = blocked
+    task = asyncio.create_task(manager.submit("alice", "one"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    await asyncio.gather(*manager.background_tasks)
+    assert manager.get("alice").process.prompts == ["one"]
+    assert len(manager.sandbox_service.allocated) == 1 and not manager.sandbox_service.destroyed
+
+
+async def test_process_failure_destroys_assignment_without_process(manager):
+    manager.process_factory = SimpleNamespace(create=AsyncMock(side_effect=RuntimeError("attachment")))
+    with pytest.raises(ChatError):
+        await manager.submit("alice", "one")
+    assert manager.get("alice").process is None
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+    assert len(manager.sandbox_service.destroyed) == 1
+
+
+async def test_container_destruction_runs_after_process_cleanup_failure(manager):
+    await manager.submit("alice", "one")
+    conversation = manager.get("alice")
+    conversation.process.close = AsyncMock(side_effect=RuntimeError("termination failed"))
+    await manager.reset("alice")
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+
+
+async def test_exec_credentials_are_only_process_environment(transport):
+    process, stream, service, received, failures = transport
+    call = service.exec.call_args
+    assert call.kwargs["name"] == "test-container"
+    assert call.kwargs["environment"] == {"ANTHROPIC_API_KEY": "secret-api-key"}
+    assert "ANTHROPIC_API_KEY" not in call.args[0]
+    assert "secret-api-key" not in call.args[0]
+    assert all(call.kwargs["name"] == "test-container" for call in service.run.call_args_list)

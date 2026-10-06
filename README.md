@@ -5,7 +5,8 @@ FastAPI lets each user connect a Google account for **read-only** Gmail and Goog
 The legacy CLI (`assistant-agent accounts`, `verify`, `export-2026`) continues to use local `data/tokens.json` and export files. That store is separate from web users and is not migrated automatically.
 
 Connected users share one live Claude conversation across their tabs and logins. The app
-keeps a non-TTY Docker exec open per user in the existing `sandbox-1` container, sends
+allocates a dedicated sandbox container on the first accepted prompt and keeps a non-TTY
+Docker exec open for that conversation, sends
 newline-delimited JSON prompts to stdin, and continuously reads structured stdout.
 `POST /api/message` accepts a prompt with the session cookie and CSRF token and returns
 `202` with conversation/turn IDs. `GET /api/conversation` returns the in-memory transcript;
@@ -17,15 +18,16 @@ Turns continue if the browser disconnects. Overlapping prompts return `409`; tur
 a two-minute deadline. Idle conversations expire after 30 minutes. All conversations
 and context are lost on app restart; there is no disk persistence or automatic retry.
 A failed CLI conversation requires a new conversation. Tools and MCP remain disabled, so
-Claude cannot read or change workspace files. Per-user sandboxes are needed before
-enabling file and command tools for web requests.
+Claude cannot read or change workspace files. Token issuance, input publication, and file-download tools remain later phases.
 
-Run exactly one app worker/replica per sandbox: the conversation manager is process-local
-and startup cleans up earlier chat process groups. Configure `CHAT_MAX_SESSIONS`
+Run exactly one app worker/replica per deployment: the conversation manager is process-local
+and startup removes earlier containers belonging to that deployment. Configure `CHAT_MAX_SESSIONS`
 (default `4`) and `CHAT_IDLE_SECONDS` (default `1800`) in the app environment. Each
 conversation accepts up to 2 MiB of cumulative prompt/response text. SSE clients replay
 up to 2048 recent events; clients behind that window reload the transcript snapshot.
-These limits also bound conversations without active CLI processes.
+Pending allocations, live containers, and failed container cleanup continue to consume
+sandbox capacity until removal is confirmed. Allocation and readiness have a 30-second
+budget, followed by a 15-second Claude startup budget.
 
 Alembic revision `0002` assigns an internal `user_id` to existing web users, retains each unique `google_sub`, and updates existing sessions to reference the new key. Run `uv run --env-file .env alembic upgrade head` before starting the updated app locally. The deployment script runs migrations automatically on EC2.
 
@@ -53,11 +55,20 @@ For local Compose, create `deploy/local-db-password.txt` (ignored by Git), put t
 ./deploy/local.sh
 ```
 
-The script builds the app and sandbox, discovers Docker socket permissions, runs database migrations, and waits for readiness. Run it again after source changes to rebuild the containers. At `http://localhost:8000`, sign in and use the **Ask the assistant** card. Claude stays running across turns and streams responses into the chat transcript; tools and disk persistence remain disabled.
+The script builds the app and tagged sandbox image, resolves the absolute host session
+root to `<repo>/data/session-inputs`, initializes it as UID 10001 with mode `0700`, discovers
+Docker socket permissions, runs database migrations, and waits for readiness. Run it again after source changes to rebuild the containers. At `http://localhost:8000`, sign in and use the **Ask the assistant** card. Claude stays running across turns and streams responses into the chat transcript; tools and disk persistence remain disabled.
 
-The app listens on `127.0.0.1:8000` and PostgreSQL on `127.0.0.1:5432`. The sandbox publishes no ports and has no workspace mount. Local exports under `data/` do not enter the containers. The app mounts the Docker socket to execute commands in the sandbox, matching production; this grants control of the local Docker daemon.
+The app listens on `127.0.0.1:8000` and PostgreSQL on `127.0.0.1:5432`. Dedicated sandboxes publish no ports and keep `/workspace` in their disposable container
+layer. Only their conversation input directory is mounted at `/input:ro`. Local exports under `data/` do not enter the containers. The app mounts the Docker socket to execute commands in the sandbox, matching production; this grants control of the local Docker daemon.
 
-Use `docker compose ps` to inspect services and `docker compose logs app sandbox-1` for diagnostics. Stop with `docker compose down`, which preserves database data. Sandbox recreation discards its files. Set `DATABASE_URL` for the host if you run migrations outside Docker.
+Before running Compose diagnostics directly, export the same host path from the repo root:
+
+```bash
+export SANDBOX_HOST_INPUT_ROOT="$(pwd -P)/data/session-inputs"
+```
+
+Use `docker compose ps` to inspect services and `docker compose logs app` for diagnostics. Stop with `docker compose down`, which preserves database data. Ending a conversation discards its sandbox files. Set `DATABASE_URL` for the host if you run migrations outside Docker.
 
 ### Agent kit
 
@@ -110,7 +121,9 @@ Use `\dt` to list tables, `\d web_sessions` to inspect the session table's colum
 
 ## AWS deployment
 
-The target is one `t4g.medium` in `us-east-1`. PostgreSQL, Caddy, and one agent sandbox run with the app on Docker Compose. An encrypted, retained EBS volume holds PostgreSQL data, Caddy certificates, and the sandbox workspace. There is **no database backup** in this phase; loss of this volume would require users to reconnect. Terraform creates a VPC, one public and two reserved private subnets, Elastic IP, two ECR repositories, instance role, SSM access, and an instance-status alarm. Only 80 and 443 are open inbound. SSH is through [Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html), with no inbound SSH rule.
+The target is one `t4g.medium` in `us-east-1`. PostgreSQL, Caddy, and the app run on Docker Compose; the app manages up to four
+dedicated conversation sandboxes. An encrypted, retained EBS volume holds PostgreSQL
+data, Caddy certificates, and downloaded session inputs. Sandbox workspaces are disposable. There is **no database backup** in this phase; loss of this volume would require users to reconnect. Terraform creates a VPC, one public and two reserved private subnets, Elastic IP, two ECR repositories, instance role, SSM access, and an instance-status alarm. Only 80 and 443 are open inbound. SSH is through [Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html), with no inbound SSH rule.
 
 The root volume is 30 GiB rather than the AMI's 8 GiB default: it holds `/var/lib/docker`, and the sandbox image alone is roughly 1.9 GiB. `deploy/remote.sh` also creates a 2 GiB swap file there, because Amazon Linux 2023 ships without swap and 4 GiB of RAM leaves little slack once an agent is working.
 
@@ -152,40 +165,54 @@ Bucket versioning retains overwritten and deleted object versions, which incur S
 
 ### The agent sandbox
 
-`sandbox-1` is a long-lived idle container that the app drives with `docker exec`. It
-restarts with the rest of the stack because Docker's `restart: unless-stopped` policy
-resurrects it at boot; nothing re-runs `docker compose up`. Its workspace is
-`/srv/assistant-agent/sandboxes/1` on the EBS volume, mounted at `/workspace` and owned
-by uid 1000, the image's `agent` user. It runs with every capability dropped,
-`no-new-privileges`, a 2 GiB memory cap, and a 1-CPU ceiling.
+The app creates one container per conversation and reuses it across turns. Reset,
+disconnect, idle expiry, turn or transport failure, and shutdown retire the conversation,
+terminate its process group, force-remove its container, and then delete its inputs.
+Startup removes abandoned containers labeled for this deployment and generated session
+directories. It never adopts an earlier container. Docker outages or incomplete cleanup
+leave the web app available but block new allocation until reconciliation succeeds.
 
-Exec works because `deploy/compose.prod.yaml` bind-mounts `/var/run/docker.sock` into the
-app container and adds the host's docker group through `group_add`, which
-`deploy/remote.sh` resolves at deploy time. Being on a shared Compose network is not what
-enables it — `docker exec` is a call to the daemon, not a connection to the container.
+Each sandbox runs as UID 1000 with init, all capabilities dropped,
+`no-new-privileges`, PID limit 2048, 2 GiB memory, one CPU, bounded Docker logs, and
+restart policy `no`. It has no published ports or Docker socket. Four slots deliberately
+allow memory overcommit on the 4 GiB production host. Images are built/pulled during
+deployment, never during chat requests. The vendored sandbox image remains unchanged.
 
-**That socket is root-equivalent control of the instance.** Anything that can execute code
-in the app container can start a privileged container and mount the host filesystem.
-Before the app handles untrusted input, put a socket proxy in front of it that exposes
-only the exec endpoints. Two related gaps: the sandbox shares the default network with
-`db` and `app`, so an agent can reach them (it has no PostgreSQL password, which lives
-only in the `db` and `app` environments); and sandbox egress is unrestricted.
+Configure `SANDBOX_IMAGE`, `SANDBOX_DEPLOYMENT_ID`, `SANDBOX_NETWORK`,
+`SANDBOX_HOST_INPUT_ROOT`, and `SANDBOX_APP_INPUT_ROOT`. Docker bind sources use
+the daemon-host root, while the app creates directories through the app-visible root.
+Production uses `/srv/assistant-agent/session-inputs` for both; local deployment mounts the
+absolute `<repo>/data/session-inputs` there. The root is owned by app UID 10001 with mode `0700`. Each conversation input
+directory, `session-inputs/<conversation-id>`, is owned by the app with mode `0755`.
+Future published input files must use `0644`, and nested directories `0755`, so sandbox
+UID 1000 can read them through `/input:ro`. These are downloaded inputs, not saved
+conversations. Container deletion discards `/workspace`, copied inputs, CLI state, and
+processes. Deployment leaves the old shared workspace files unused.
+
+The app mounts `/var/run/docker.sock` and receives the daemon's group via `group_add`.
+**That socket grants root-equivalent control of the Docker host.** Sandboxes attach only
+to an explicitly named bridge, where the app is reachable as `app`. Backend services
+stay on the Compose default network. The bridge still exposes all app routes and is
+not a complete network isolation boundary; sandbox egress remains unrestricted.
+Google credentials stay in the app. The Anthropic key is supplied only to the Claude
+exec environment and is absent from sandbox-wide configuration.
 
 ```bash
-uv run assistant-agent sandbox                      # status: is it up, is the CLI there
-uv run assistant-agent sandbox claude --version     # run a command inside it
+uv run assistant-agent sandbox                              # daemon/image/network readiness
+uv run assistant-agent sandbox --container CONTAINER_ID claude --version
 ```
 
-After deployment, verify the page over HTTPS, complete Google's consent for both scopes, disconnect and reconnect, then restart the app and instance to confirm the database, Caddy data, and the sandbox all come back. The domain and Google verification are external prerequisites; they are not supplied by this repository. The instance role has no application S3 permissions. Add them only when storage is implemented. A future managed PostgreSQL migration can use the reserved private subnets.
+After deployment, verify the page over HTTPS, complete Google's consent for both scopes, disconnect and reconnect, then restart the app and instance to confirm the database and Caddy data survive, while old conversation sandboxes are removed. The domain and Google verification are external prerequisites; they are not supplied by this repository. The instance role has no application S3 permissions. Add them only when storage is implemented. A future managed PostgreSQL migration can use the reserved private subnets.
 
 ## Checks
 
 ```bash
 uv run pytest -q
 DATABASE_URL=sqlite:////tmp/assistant-agent-migration.db uv run alembic upgrade head
+SANDBOX_HOST_INPUT_ROOT="$PWD/data/session-inputs" docker compose config --quiet
 DOMAIN=example.com IMAGE_URI=example.invalid/app:test SANDBOX_IMAGE_URI=example.invalid/sandbox:test DOCKER_GID=991 POSTGRES_PASSWORD=test GOOGLE_CLIENT_ID=test GOOGLE_CLIENT_SECRET=test CREDENTIAL_ENCRYPTION_KEY=test ANTHROPIC_API_KEY=test docker compose -f deploy/compose.prod.yaml config --quiet
 terraform -chdir=terraform/main validate
-bash -n deploy/remote.sh && bash -n deploy/deploy.sh
+bash -n deploy/local.sh deploy/remote.sh deploy/deploy.sh
 docker buildx build --platform linux/arm64 -f src/assistant_agent/sandbox_kit/Dockerfile src/assistant_agent/sandbox_kit
 ```
 
@@ -207,7 +234,7 @@ or chat operations. Credential refresh updates existing users only, so a late
 refresh cannot recreate a disconnected account. Chat conversations and Docker exec use
 asyncio and aiodocker on the app event loop. The lifespan owns separate Docker
 clients for control commands and interactive attachments, and joins chat work
-before closing them. Run one app worker per sandbox. The CLI exporter remains
+before closing them. Run one app worker per deployment. The CLI exporter remains
 synchronous.
 
 Run the optional PostgreSQL check against a development database:
@@ -223,7 +250,8 @@ transaction cancellation, SSE authentication expiry, and lifespan cleanup failur
 
 ### Live chat integration check
 
-With the Compose sandbox running, verify the Docker transport without model credentials:
+With Docker running and the configured sandbox image already built, verify dedicated
+container lifecycle and streaming transport without model calls:
 
 ```bash
 SANDBOX_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_sandbox_async.py
@@ -235,7 +263,8 @@ application uses aiodocker's public stream API; its protocol and transcript limi
 remain 2 MiB. Docker frame allocation belongs to aiodocker, which does not impose
 the old application's 16 MiB frame header limit.
 
-With the existing sandbox running and authenticated, run the opt-in two-turn test:
+For the optional two-turn model check, configure the app Anthropic key and sandbox
+settings, then run:
 
 ```bash
 CHAT_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_chat.py -k real_claude

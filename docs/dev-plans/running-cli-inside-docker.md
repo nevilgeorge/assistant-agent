@@ -1,144 +1,113 @@
 # Running agent CLIs inside Docker
 
-Last updated: 2026-10-05.
+Last updated: 2026-10-06.
 
-This is the living design and context document for how assistant-agent communicates with agent CLIs inside Docker. Update it when the transport, session lifecycle, recovery, or storage design changes. It describes the implemented behavior and explicitly separates future ideas from completed work.
+This living note describes the implemented transport, conversation lifecycle, recovery,
+and storage boundaries. Conversation transcripts and state remain only in app memory.
 
-## Phase 1: Long-lived Claude Code process inside an existing long-running Docker container. 
+## Phase 2: Dedicated conversation sandbox lifecycle
 
-### Context for a new chat
+Each authenticated internal user shares one conversation across browser tabs and logins.
+The first accepted prompt reserves capacity and creates a dedicated container, represented
+by an immutable handle with container ID, internal user ID, conversation ID, and host/app
+input paths. Later turns reuse that assignment and its persistent Claude process. The
+handle belongs to the conversation independently of whether Claude attached successfully.
 
-The first major change replaced the web chat's one-shot Claude invocation with a long-lived Claude Code process inside an existing long-running Docker container. The assistant-agent service sends each prompt to that process's stdin and continuously reads structured stdout through a non-TTY Docker exec socket. Multiple turns reuse the same Claude process and its in-memory context.
+The app owns container creation, readiness, retirement, and recovery. Compose owns only
+the app, PostgreSQL, Caddy, and networks. Allocation/readiness has a 30-second budget;
+Claude startup then has its existing 15-second budget. Images must already exist, and
+request handling never pulls them. Explicit container IDs are required for exec and
+readiness; there is no shared-container fallback.
 
-The implementation is scoped to Claude Code, with tools and MCP disabled. It does not use ACP, an HTTP server inside the container, or a WebSocket to the CLI. Codex support and workspace tools were intentionally left out. Browser streaming uses Server-Sent Events (SSE), independently of the Docker connection.
+Retirement closes the process group and exec attachment, force-removes the assigned
+container even if process cleanup fails, then deletes input directories. Reset,
+disconnect, idle expiry, turn/transport failure, and app shutdown use this path. Allocation
+and process startup both check retirement before activating their acquired resources.
+Accepted startup and cleanup survive HTTP request cancellation. Failed destruction stays
+queued for sweeper retries and continues to occupy capacity until removal is confirmed.
+Account disconnection deletes credentials and browser sessions even if Docker is down.
 
-Transcripts currently live only in assistant-agent memory. PostgreSQL stores authentication data, but conversation persistence has only been discussed, not implemented. The latest proposed next step is to persist normalized messages from the assistant-agent service, keeping database access outside the sandbox. Saving a transcript and recovering Claude's session context are separate problems.
+Startup reconciles containers with application ownership and this deployment's labels,
+removes earlier assignments, then cleans abandoned generated input directories. It never
+adopts an old container because conversations are not persisted. Deterministic names
+allow ambiguous create results to be recovered. Another deployment's containers and
+unrelated files are untouched. Generated-directory cleanup rejects symlinks and escaping
+paths. Inputs are deleted only after the corresponding container is gone. If Docker is
+unavailable or cleanup is incomplete, the web app stays available while new sandbox
+allocation is blocked; reconciliation retries before agent startup.
 
-### Why this change was needed
+Run one app worker/replica per deployment. `CHAT_MAX_SESSIONS=4` counts pending allocation,
+live containers, and failed container cleanup; reset/startup races must not exceed that
+cap. Four slots accept memory overcommit on the current 4 GiB production host.
 
-Previously, the web chat used `sandbox.ask()` to execute a separate Claude command for each prompt and wait for its complete output. The goal was to keep a Claude session alive across turns and render responses incrementally in the web UI without introducing a container-side server or ACP for the MVP.
+## Storage and security
 
-The container lifetime, Claude process lifetime, and browser connection lifetime are separate:
+`SANDBOX_IMAGE`, `SANDBOX_DEPLOYMENT_ID`, `SANDBOX_NETWORK`,
+`SANDBOX_HOST_INPUT_ROOT`, and `SANDBOX_APP_INPUT_ROOT` configure lifecycle.
+Production's daemon-host root is `/srv/assistant-agent/session-inputs`. Local deployment
+resolves `<repo>/data/session-inputs` to an absolute path. Both mount the root read/write into
+the app at `/srv/assistant-agent/session-inputs`; bind sources for sandboxes use the host root.
 
-- Docker Compose owns the long-running container.
-- assistant-agent owns each user's Claude process and conversation state.
-- A browser subscribes to the conversation; disconnecting it does not stop the turn or Claude process.
+The root belongs to app UID 10001 and uses `0700`. Each server-generated
+`session-inputs/<conversation-id>` directory belongs to the app and uses `0755`,
+bound as `/input:ro`.
+Future atomic publication must use `0644` files and `0755` nested directories for sandbox
+UID 1000. File downloads and publication belong to later phases. These directories are
+inputs, not persisted conversations. `/workspace` remains in the image's writable
+agent-owned layer; removal discards workspace files, copied inputs, processes, and CLI
+state. Old shared workspace files are left unused.
 
-### Communication flow
+Containers preserve non-root execution, init, dropped capabilities,
+`no-new-privileges`, PID limit 2048, 2 GiB memory, one CPU, and bounded Docker logs. They
+have restart policy `no`, publish no ports, and mount no Docker socket. Sandboxes join
+only the explicitly named bridge; the app has alias `app`. Backend services stay on the
+existing Compose network. The bridge exposes all app routes and is not complete network
+isolation; egress remains unrestricted.
 
-```text
-Browser
-  | POST /api/message: prompt + conversation ID
-  v
-assistant-agent / SessionManager
-  | newline-delimited stream-json user message -> stdin
-  v
-Persistent non-TTY Docker exec -> Claude Code process
-  | stream-json events <- stdout
-  v
-ClaudeProcess reader -> Conversation state + bounded event buffer
-  | GET /api/conversation/stream: SSE events
-  v
-Browser renders assistant text incrementally
-```
+Google/application credentials never enter container-wide sandbox environment variables.
+The Anthropic key is forwarded through aiodocker's exec environment, never interpolated
+into shell commands or logged. Separate control and chat Docker clients are retained.
+The app's Docker socket still grants root-equivalent control over the host.
 
-Each user has an independent conversation and CLI process inside the same sandbox container. Tabs and logins for the same authenticated internal `user_id` share that user's conversation. This is process-level separation within a shared container, not a separate Docker sandbox per user.
+## Transport and browser behavior
 
-#### Starting the container and CLI
+The app keeps a non-TTY Docker exec open as sandbox user `agent` in `/workspace` and sends
+newline-delimited stream-json prompts to its stdin. Claude runs under `setsid --wait`
+with a PID file for process-group and descendant termination. Claude keeps context across
+turns, uses `--no-session-persistence`, and has tools and MCP disabled. Token issuance,
+Gmail/MCP activation, file-download tools, and transcript persistence are later phases.
 
-The `sandbox-1` service in the local and production Compose files runs `sleep infinity` after marking itself ready. Its default container name is `assistant-agent-sandbox-1`, configurable in the app through `SANDBOX_CONTAINER`. assistant-agent connects to the Docker daemon using the Docker Python SDK; it does not create the container on a chat request.
+A background reader drains separate stdout/stderr, decodes UTF-8 incrementally, and
+normalizes Claude JSON into bounded transcript/events. Stderr and raw prompt diagnostics
+are not logged. `POST /api/message` requires the authenticated cookie and CSRF token,
+returns `202` with conversation/turn IDs, and rejects overlapping prompts with `409`.
+`GET /api/conversation` provides the in-memory snapshot. SSE at
+`GET /api/conversation/stream?conversation_id=...&after=...` streams deltas and turn events,
+with sequence replay and `Last-Event-ID` support. Stale cursors trigger snapshot reload.
+`POST /api/conversation/reset` retires the assignment. The browser renders plain text.
 
-FastAPI's lifespan starts `SessionManager`, cleans up orphaned chat processes from an earlier app instance, and starts an idle-session sweeper. If the sandbox is unavailable at startup, cleanup is retried before a CLI can be spawned.
+Browser disconnection does not stop an accepted turn. Turns retain the 120-second
+budget; idle expiry defaults to 1,800 seconds. Conversations permit 2 MiB cumulative
+prompt/response text and replay the last 2,048 events. A failed CLI conversation needs a
+new conversation. App restart loses transcripts and Claude context; there is no automatic
+retry or resume.
 
-A conversation object can exist before a CLI process exists. On the first submitted prompt, `SessionManager.submit()` lazily starts `ClaudeProcess` through Docker exec. Later prompts reuse that process. The exec runs as user `agent` in `/workspace`, with stdin, stdout, and stderr attached and `tty=False`.
+## Deployment and diagnostics
 
-The current Claude command is:
+Local deployment builds a tagged sandbox image and initializes app-owned storage using
+one root app container. Production explicitly pulls the existing sandbox image and
+initializes session storage on the retained volume. Both remove the retired Compose
+sandbox as an orphan. The byte-identical vendored image is unchanged.
 
 ```bash
-claude -p \
-  --input-format stream-json \
-  --output-format stream-json \
-  --verbose \
-  --include-partial-messages \
-  --no-session-persistence \
-  --restricted \
-  --tools '' \
-  --disallowedTools 'mcp__*'
+uv run assistant-agent sandbox
+uv run assistant-agent sandbox --container CONTAINER_ID claude --version
+SANDBOX_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_sandbox_async.py
 ```
 
-Here, `-p` is used with streaming input: keeping stdin open lets us submit successive turns to the same process. The command is wrapped with `setsid --wait` and a PID file so assistant-agent can terminate the process group and its descendants when retiring the conversation.
-
-#### Sending prompts and reading responses
-
-For each prompt, `ClaudeProcess.send()` writes one JSON object followed by a newline to the open exec socket:
-
-```json
-{"type":"user","message":{"role":"user","content":"The user's prompt"}}
-```
-
-It does not close stdin after sending. A write lock serializes socket writes. The session manager permits only one active turn per conversation; overlapping submissions receive `409`.
-
-A background reader continuously drains the Docker socket. Docker's non-TTY output has multiplexed stdout/stderr frames with eight-byte headers. `DockerFrames` incrementally separates those frames, including headers or payloads split across socket reads. The reader incrementally decodes UTF-8 stdout and parses newline-delimited Claude JSON events. Stderr is drained but discarded; raw diagnostics and prompts are not logged.
-
-`Conversation` converts Claude events into application events:
-
-- `stream_event` text deltas append to the assistant message and emit `assistant_delta`.
-- Full assistant text provides a fallback when no text deltas have been received, avoiding duplicated output.
-- A successful `result` ends the turn and emits `turn_completion`; it does not close the CLI process.
-- Error results, malformed output, unexpected EOF, or transport failures fail the conversation and require a new one. Partial assistant text remains in the live transcript.
-
-Conversation and manager locks protect in-memory state. Process spawning, sending, and closing occur outside those locks so Docker I/O does not block browser stream polling or unrelated conversations.
-
-#### Delivering output to the web UI
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /api/message` | Accept a prompt; return `202` with conversation and turn IDs. |
-| `GET /api/conversation` | Return the current in-memory transcript, sequence, active turn, and failure state. |
-| `GET /api/conversation/stream?conversation_id=...&after=...` | Stream normalized events using SSE. |
-| `POST /api/conversation/reset` | Retire the current conversation and terminate its CLI process. |
-
-Endpoints use the authenticated browser session. Mutations also require a CSRF token. Events carry conversation ID, turn ID, and a monotonically increasing sequence; SSE uses that sequence as the event ID. Reconnection supports `Last-Event-ID`. If the requested cursor falls outside the replay window or the conversation ID is stale, the server sends `reload` so the browser fetches a fresh snapshot.
-
-The browser renders messages as plain text and updates the assistant bubble as deltas arrive. Its HTTP/SSE connection does not own the Docker socket. The reader continues consuming Claude output if a tab closes or its network connection drops; a returning tab can load the current snapshot and subscribe again while the conversation remains alive.
-
-### Lifecycle and current limits
-
-- Each turn has a 120-second deadline. Timeout fails the conversation and terminates its process. Timers are tied to turn IDs so an old timeout cannot terminate a later turn.
-- `CHAT_IDLE_SECONDS` defaults to `1800`. A sweeper checks every 30 seconds and retires inactive conversations; it skips active turns and processes being started.
-- `CHAT_MAX_SESSIONS` defaults to `4`. The cap includes conversation objects that have not started a CLI yet.
-- Each conversation allows 2 MiB of cumulative prompt/response text. The event replay buffer holds the latest 2,048 events.
-- Reset, account disconnect, idle expiry, and app shutdown retire the relevant process. Process teardown uses the recorded process group, then closes the exec socket and Docker client.
-- Startup cleanup removes orphaned chat process groups from an earlier app instance.
-- Run exactly one app worker/replica per sandbox. Ownership is process-local, and startup cleanup would interfere with another app instance's processes.
-
-### Persistence and recovery boundaries
-
-`--no-session-persistence` is still enabled. The running Claude process retains context between turns, but this implementation does not use Claude's on-disk session persistence or resume support. App restart loses the in-memory transcript, and startup cleanup terminates surviving chat processes. Container restart or CLI failure also loses the live session. There is no automatic prompt retry, transcript reconstruction, or session resume.
-
-Removing `--no-session-persistence` alone would not implement recovery: assistant-agent would still need to track Claude session IDs, retain the session files, and explicitly resume the right session. Browser reconnection currently recovers access to a live conversation, not a failed CLI session.
-
-The proposed PostgreSQL follow-up is to write from assistant-agent, where authenticated user identity, conversation IDs, turn IDs, and normalized text are already available. The discussion suggested conversation and message tables, recording user input before sending, periodically checkpointing assistant text, and finalizing messages as completed, failed, or interrupted. This remains a proposal; no transcript schema or writes have been added.
-
-Tools and MCP remain disabled because users share a container and workspace. Enabling file or command tools requires revisiting user isolation first.
-
-### Code map and validation
-
-Paths below are relative to the repository root:
-
-| File | Responsibility |
-| --- | --- |
-| `src/assistant_agent/chat.py` | Docker stream framing, persistent Claude process, conversation events/state, session manager, cleanup, and limits. |
-| `src/assistant_agent/web.py` | App lifecycle, authenticated chat endpoints, and SSE delivery. |
-| `src/assistant_agent/templates/connected.html` | Chat UI, prompt submission, snapshot loading, and SSE handling. |
-| `src/assistant_agent/sandbox.py` | Shared Docker configuration/client helpers and legacy one-shot helpers. `ask()` remains available but is no longer the web chat path. |
-| `compose.yaml` and `deploy/compose.prod.yaml` | Container lifecycle and app configuration. |
-| `tests/test_chat.py` | Session/transport tests and opt-in real Docker/Claude integration. |
-| `tests/test_web_auth.py` | Chat authentication, isolation, endpoints, and SSE tests. |
-
-The initial implementation was validated against a real Docker container and Claude CLI: two turns reused the same process, Claude recalled context from the first turn, text deltas were emitted, and reset terminated the exec. Automated tests also cover framing, split Unicode/JSON, failure handling, isolation, capacity, timeouts, cleanup, and process-I/O concurrency.
-
-To run the opt-in integration test with Docker and Claude credentials configured:
+Untargeted status inspects daemon/image/network readiness without creating a sandbox.
+Unit/web tests use injected lifecycle/process fakes; opt-in Docker checks use a small
+streaming process without model calls. An optional real Claude check remains separate:
 
 ```bash
 CHAT_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_chat.py -k real_claude

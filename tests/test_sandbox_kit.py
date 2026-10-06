@@ -54,22 +54,20 @@ def test_dockerfile_still_copies_only_the_entrypoint_from_the_context() -> None:
     assert "docker/entrypoint.sh" in context_copies[0]
 
 
-def test_container_name_defaults_and_honours_the_environment(monkeypatch) -> None:
-    monkeypatch.delenv("SANDBOX_CONTAINER", raising=False)
-    assert sandbox.container_name() == sandbox.DEFAULT_CONTAINER
-    # compose.prod.yaml sets this, so the default is only a fallback.
-    monkeypatch.setenv("SANDBOX_CONTAINER", "other-sandbox")
-    assert sandbox.container_name() == "other-sandbox"
-    # A blank value is the same as unset: compose writes empty strings for unset vars.
-    monkeypatch.setenv("SANDBOX_CONTAINER", "   ")
-    assert sandbox.container_name() == sandbox.DEFAULT_CONTAINER
+async def test_execution_requires_an_explicit_target(monkeypatch) -> None:
+    monkeypatch.setenv("SANDBOX_CONTAINER", "old-shared-container")
+    async with sandbox.Sandbox() as service:
+        with pytest.raises(TypeError, match="name"):
+            await service.exec("true")
+        with pytest.raises(TypeError, match="name"):
+            await service.run("true")
 
 
 async def test_run_reports_an_unreachable_daemon_as_sandbox_error(monkeypatch) -> None:
     """Importing the module must not require Docker; calling it must fail clearly."""
     monkeypatch.setenv("DOCKER_HOST", "unix:///nonexistent/docker.sock")
     with pytest.raises(sandbox.SandboxError):
-        await sandbox.run("true")
+        await sandbox.run("true", name="explicit-container")
 
 
 def test_exec_result_ok_tracks_the_exit_code() -> None:
@@ -93,13 +91,15 @@ async def test_run_argv_quotes_its_arguments(monkeypatch) -> None:
 async def test_ask_passes_message_as_one_argument_without_tools(monkeypatch) -> None:
     seen = {}
 
-    async def fake_run_argv(argv):
+    async def fake_run_argv(argv, **kwargs):
         seen["argv"] = argv
+        seen["name"] = kwargs["name"]
         return sandbox.ExecResult(0, "answer")
 
     monkeypatch.setattr(sandbox, "run_argv", fake_run_argv)
     prompt = "--help; $(touch /tmp/unwanted)"
-    assert (await sandbox.ask(prompt)).output == "answer"
+    assert (await sandbox.ask(prompt, name="chosen-container")).output == "answer"
+    assert seen["name"] == "chosen-container"
     assert seen["argv"][-1] == prompt
     # Claude's variadic tool flags must not consume the prompt, even if it starts '-'.
     assert seen["argv"][-2] == "--"
@@ -132,10 +132,8 @@ def test_compose_wires_the_sandbox_to_the_vendored_image() -> None:
     compose = (SANDBOX_KIT_DIR.parents[2] / "deploy" / "compose.prod.yaml").read_text(
         encoding="utf-8"
     )
-    # The container the app execs into must be the one compose names.
-    assert f"container_name: {sandbox.DEFAULT_CONTAINER}" in compose
-    assert f"SANDBOX_CONTAINER: {sandbox.DEFAULT_CONTAINER}" in compose
-    # Without --rm's absence and a blocking command, the container would exit at once.
-    assert "exec sleep infinity" in compose
-    # The socket, not the network, is what makes docker exec possible.
+    assert "sandbox-1:" not in compose and "SANDBOX_CONTAINER:" not in compose
+    assert "SANDBOX_IMAGE:" in compose and "SANDBOX_NETWORK:" in compose
+    assert "SANDBOX_HOST_INPUT_ROOT:" in compose and "SANDBOX_APP_INPUT_ROOT:" in compose
+    assert "/srv/assistant-agent/session-inputs:/srv/assistant-agent/session-inputs" in compose
     assert "/var/run/docker.sock:/var/run/docker.sock" in compose

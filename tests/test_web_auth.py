@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -25,26 +26,25 @@ async def web(tmp_path, monkeypatch):
     monkeypatch.setenv("BASE_URL", "http://localhost:8000")
     monkeypatch.setenv("APP_ENV", "development")
     from assistant_agent import config, web as module
-    from assistant_agent import chat
-    from test_chat import FakeProcess
+    from test_chat import FakeProcess, FakeSandbox
 
     config.get_settings.cache_clear()
-    monkeypatch.setattr(chat, "cleanup_orphans", AsyncMock())
+    monkeypatch.setattr(module, "Sandbox", FakeSandbox)
     application = module.create_app()
     clients = []
     try:
         async with AsyncExitStack() as stack:
             await stack.enter_async_context(application.router.lifespan_context(application))
             state = application.state
-            monkeypatch.setattr(state.chat, "factory", FakeProcess)
-            async with state.store.factory.kw["bind"].begin() as connection:
+            monkeypatch.setattr(state.conversation_manager, "process_factory", FakeProcess)
+            async with state.web_store.factory.kw["bind"].begin() as connection:
                 await connection.run_sync(Base.metadata.create_all)
             try:
                 yield SimpleNamespace(
                     app=application,
                     module=module,
-                    store=state.store,
-                    chat=state.chat,
+                    web_store=state.web_store,
+                    conversation_manager=state.conversation_manager,
                     settings=state.settings,
                     COOKIE=module.COOKIE,
                     clients=clients,
@@ -105,22 +105,22 @@ async def connect(web, monkeypatch, sub, email):
 async def test_user_isolation_and_csrf(web, monkeypatch):
     a = await connect(web, monkeypatch, "sub-a", "a@example.com")
     b = await connect(web, monkeypatch, "sub-b", "b@example.com")
-    monkeypatch.setattr(web.store, "load_refreshed", AsyncMock(return_value=credentials()))
+    monkeypatch.setattr(web.web_store, "load_refreshed", AsyncMock(return_value=credentials()))
     page = (await a.get("/")).text
     assert "a@example.com" in page and "b@example.com" not in page
     assert (await a.post("/disconnect", data={"csrf_token": "wrong"})).status_code == 400
-    assert await web.store.user_by_google_sub("sub-a") is not None
+    assert await web.web_store.user_by_google_sub("sub-a") is not None
     assert (await b.post("/disconnect", data={"csrf_token": "wrong"})).status_code == 400
-    assert await web.store.user_by_google_sub("sub-a") is not None
+    assert await web.web_store.user_by_google_sub("sub-a") is not None
     assert (await client_for(web).post("/disconnect", data={})).status_code == 401
-    session = await web.store.session(a.cookies.get(web.COOKIE))
+    session = await web.web_store.session(a.cookies.get(web.COOKIE))
     monkeypatch.setattr(web.module, "revoke", lambda creds: True)
     assert (
         await a.post("/disconnect", data={"csrf_token": session.csrf_token}, follow_redirects=False)
     ).status_code == 303
     assert (
-        await web.store.user_by_google_sub("sub-a") is None
-        and await web.store.user_by_google_sub("sub-b") is not None
+        await web.web_store.user_by_google_sub("sub-a") is None
+        and await web.web_store.user_by_google_sub("sub-b") is not None
     )
 
 
@@ -151,25 +151,25 @@ async def test_state_consumed_and_nonce_passed(web, monkeypatch):
 
 async def test_session_expiry_and_encrypted_credentials(web, monkeypatch):
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
-    user = await web.store.user_by_google_sub("sub-a")
+    user = await web.web_store.user_by_google_sub("sub-a")
     assert len(user.user_id) == 32 and user.user_id != user.google_sub
     assert b"refresh" not in user.credentials
-    assert (await web.store.load_credentials(user.user_id)).refresh_token == "refresh"
+    assert (await web.web_store.load_credentials(user.user_id)).refresh_token == "refresh"
     token = client.cookies.get(web.COOKIE)
     from assistant_agent.web_store import WebStore
 
-    reloaded = WebStore(factory=web.store.factory, key=web.settings.credential_encryption_key)
+    reloaded = WebStore(factory=web.web_store.factory, key=web.settings.credential_encryption_key)
     assert (await reloaded.session(token)).user_id == user.user_id
     assert (await reloaded.load_credentials(user.user_id)).refresh_token == "refresh"
-    async with web.store.factory.begin() as db:
-        row = await db.get(WebSession, (await web.store.session(token)).id)
+    async with web.web_store.factory.begin() as db:
+        row = await db.get(WebSession, (await web.web_store.session(token)).id)
         row.expires_at = utcnow() - timedelta(seconds=1)
-    assert await web.store.session(token) is None
+    assert await web.web_store.session(token) is None
     assert "a@example.com" not in (await client.get("/")).text
 
 
 async def test_refresh_persists_new_token(web, monkeypatch):
-    user_id = await web.store.save_credentials("sub-a", "a@example.com", credentials())
+    user_id = await web.web_store.save_credentials("sub-a", "a@example.com", credentials())
     from google.oauth2.credentials import Credentials as GoogleCredentials
 
     monkeypatch.setattr(GoogleCredentials, "valid", property(lambda self: False))
@@ -178,37 +178,37 @@ async def test_refresh_persists_new_token(web, monkeypatch):
         self.token = "new-access"
 
     monkeypatch.setattr(GoogleCredentials, "refresh", refresh)
-    assert (await web.store.load_refreshed(user_id)).token == "new-access"
-    assert (await web.store.load_credentials(user_id)).token == "new-access"
+    assert (await web.web_store.load_refreshed(user_id)).token == "new-access"
+    assert (await web.web_store.load_credentials(user_id)).token == "new-access"
 
 
 async def test_reconnect_preserves_internal_user_id(web):
-    user_id = await web.store.save_credentials(
+    user_id = await web.web_store.save_credentials(
         "stable-google-sub", "old@example.com", credentials()
     )
-    again = await web.store.save_credentials("stable-google-sub", "new@example.com", credentials())
+    again = await web.web_store.save_credentials("stable-google-sub", "new@example.com", credentials())
     assert again == user_id
-    assert (await web.store.user(user_id)).email == "new@example.com"
-    assert (await web.store.user_by_google_sub("stable-google-sub")).user_id == user_id
+    assert (await web.web_store.user(user_id)).email == "new@example.com"
+    assert (await web.web_store.user_by_google_sub("stable-google-sub")).user_id == user_id
 
 
 async def test_session_id_and_token_rotation(web):
     from assistant_agent.web_store import token_hash
 
-    (old_token, original) = await web.store.new_session()
+    (old_token, original) = await web.web_store.new_session()
     assert len(original.id) == 32
     assert original.session_token_hash == token_hash(old_token)
     assert original.id != original.session_token_hash
     original.oauth_state = "saved-state"
-    await web.store.save_session(original)
-    assert (await web.store.session(old_token)).oauth_state == "saved-state"
-    user_id = await web.store.save_credentials("sub-a", "a@example.com", credentials())
-    (new_token, rotated) = await web.store.rotate(old_token, user_id)
+    await web.web_store.save_session(original)
+    assert (await web.web_store.session(old_token)).oauth_state == "saved-state"
+    user_id = await web.web_store.save_credentials("sub-a", "a@example.com", credentials())
+    (new_token, rotated) = await web.web_store.rotate(old_token, user_id)
     assert rotated.id != original.id
     assert rotated.session_token_hash == token_hash(new_token)
-    assert await web.store.session(old_token) is None
-    assert (await web.store.session(new_token)).user_id == user_id
-    async with web.store.factory() as db:
+    assert await web.web_store.session(old_token) is None
+    assert (await web.web_store.session(new_token)).user_id == user_id
+    async with web.web_store.factory() as db:
         assert await db.get(WebSession, original.id) is None
         assert (await db.get(WebSession, rotated.id)).session_token_hash == token_hash(new_token)
 
@@ -253,7 +253,7 @@ async def test_verified_identity_and_nonce(web, monkeypatch):
 async def test_message_requires_auth_and_csrf_and_returns_sandbox_response(web, monkeypatch):
     calls = []
     monkeypatch.setattr(
-        web.chat,
+        web.conversation_manager,
         "submit",
         AsyncMock(side_effect=lambda user, prompt, conversation_id: calls.append(prompt)
                   or {"conversation_id": "chat", "turn_id": "turn"}),
@@ -262,7 +262,7 @@ async def test_message_requires_auth_and_csrf_and_returns_sandbox_response(web, 
     assert (await anonymous.post("/api/message", json={"message": "Hi"})).status_code == 401
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
     assert (await client.post("/api/message", json={"message": "Hi"})).status_code == 400
-    csrf = (await web.store.session(client.cookies.get(web.COOKIE))).csrf_token
+    csrf = (await web.web_store.session(client.cookies.get(web.COOKIE))).csrf_token
     headers = {"X-CSRF-Token": csrf}
     assert (
         await client.post("/api/message", json={"message": "  "}, headers=headers)
@@ -278,14 +278,88 @@ async def test_message_requires_auth_and_csrf_and_returns_sandbox_response(web, 
 
 async def test_message_reports_sandbox_failures_without_exposing_details(web, monkeypatch):
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
-    headers = {"X-CSRF-Token": (await web.store.session(client.cookies.get(web.COOKIE))).csrf_token}
+    headers = {"X-CSRF-Token": (await web.web_store.session(client.cookies.get(web.COOKIE))).csrf_token}
 
     async def unavailable(*args):
         raise ChatError("The assistant is unavailable.", 503)
 
-    monkeypatch.setattr(web.chat, "submit", unavailable)
+    monkeypatch.setattr(web.conversation_manager, "submit", unavailable)
     failed = await client.post("/api/message", json={"message": "Hi"}, headers=headers)
     assert failed.status_code == 503
+
+
+async def test_chat_routes_use_overridden_store_and_conversation_manager(web, monkeypatch):
+    from assistant_agent.web_dependencies import get_conversation_manager, get_web_store
+
+    user_id = "injected-user"
+    injected_store = SimpleNamespace(
+        session=AsyncMock(return_value=SimpleNamespace(user_id=user_id, csrf_token="injected-csrf")),
+        user=AsyncMock(return_value=SimpleNamespace(user_id=user_id)),
+    )
+    conversation = web.conversation_manager.get(user_id)
+    injected_manager = SimpleNamespace(
+        submit=AsyncMock(return_value={"conversation_id": conversation.id, "turn_id": "injected-turn"}),
+        get=lambda user: conversation,
+        reset=AsyncMock(),
+    )
+    web.app.dependency_overrides[get_web_store] = lambda: injected_store
+    web.app.dependency_overrides[get_conversation_manager] = lambda: injected_manager
+    monkeypatch.delattr(web.app.state, "web_store")
+    monkeypatch.delattr(web.app.state, "conversation_manager")
+    client = client_for(web)
+
+    response = await client.post(
+        "/api/message",
+        json={"message": "Injected prompt"},
+        headers={"X-CSRF-Token": "injected-csrf"},
+    )
+    assert response.status_code == 202
+    assert response.json()["turn_id"] == "injected-turn"
+    injected_manager.submit.assert_awaited_once_with(user_id, "Injected prompt", None)
+    snapshot = await client.get("/api/conversation")
+    assert snapshot.json()["conversation_id"] == conversation.id
+    stream = await client.get("/api/conversation/stream?conversation_id=old")
+    assert '"type": "reload"' in stream.text
+    reset = await client.post(
+        "/api/conversation/reset", headers={"X-CSRF-Token": "injected-csrf"}
+    )
+    assert reset.status_code == 200
+    injected_manager.reset.assert_awaited_once_with(user_id)
+    assert injected_store.session.await_count == 4
+
+
+async def test_oauth_callback_uses_overridden_settings_and_worker(web, monkeypatch):
+    from assistant_agent.web_dependencies import get_application_settings, get_google_worker
+
+    monkeypatch.setattr(
+        web.module, "authorization_url", lambda nonce: ("https://accounts.google.com", "state", "verifier")
+    )
+    client = client_for(web)
+    assert (await client.get("/auth/google/start")).status_code == 302
+    session = await web.web_store.session(client.cookies.get(web.COOKIE))
+    nonce = session.oauth_nonce
+    injected_settings = replace(web.settings, base_url="https://injected.example", app_env="production")
+    injected_credentials = credentials()
+    injected_worker = SimpleNamespace(
+        run=AsyncMock(side_effect=[injected_credentials, ("injected@example.com", "injected-sub")])
+    )
+    web.app.dependency_overrides[get_application_settings] = lambda: injected_settings
+    web.app.dependency_overrides[get_google_worker] = lambda: injected_worker
+    monkeypatch.delattr(web.app.state, "settings")
+    monkeypatch.delattr(web.app.state, "google_worker")
+
+    response = await client.get("/auth/google/callback?state=state&code=code")
+    assert response.status_code == 303
+    assert "Secure" in response.headers["set-cookie"]
+    assert injected_worker.run.await_args_list[0].args == (
+        web.module.exchange_code,
+        "https://injected.example/auth/google/callback?state=state&code=code",
+    )
+    assert injected_worker.run.await_args_list[1].args == (
+        web.module.account_identity, injected_credentials
+    )
+    assert injected_worker.run.await_args_list[1].kwargs == {"expected_nonce": nonce}
+    assert (await web.web_store.user_by_google_sub("injected-sub")).email == "injected@example.com"
 
 
 async def test_conversation_snapshot_isolation_reset_and_disconnect(web, monkeypatch):
@@ -295,17 +369,17 @@ async def test_conversation_snapshot_isolation_reset_and_disconnect(web, monkeyp
     assert (await b.get("/api/conversation")).json()["conversation_id"] != first["conversation_id"]
     assert (await client_for(web).get("/api/conversation")).status_code == 401
     assert (await a.post("/api/conversation/reset")).status_code == 400
-    csrf = (await web.store.session(a.cookies.get(web.COOKIE))).csrf_token
+    csrf = (await web.web_store.session(a.cookies.get(web.COOKIE))).csrf_token
     assert (
         await a.post("/api/conversation/reset", headers={"X-CSRF-Token": csrf})
     ).status_code == 200
     assert (await a.get("/api/conversation")).json()["conversation_id"] != first["conversation_id"]
     monkeypatch.setattr(web.module, "revoke", lambda creds: True)
-    user = (await web.store.user_by_google_sub("sub-a")).user_id
+    user = (await web.web_store.user_by_google_sub("sub-a")).user_id
     assert (
         await a.post("/disconnect", data={"csrf_token": csrf}, follow_redirects=False)
     ).status_code == 303
-    assert user not in web.chat.conversations
+    assert user not in web.conversation_manager.conversations
 
 
 async def test_stream_reloads_stale_conversation_and_enforces_auth(web, monkeypatch):
@@ -321,16 +395,16 @@ async def test_stream_reloads_stale_conversation_and_enforces_auth(web, monkeypa
 async def test_stream_replays_events_after_snapshot(web, monkeypatch):
     from test_chat import FakeProcess
 
-    monkeypatch.setattr(web.chat, "factory", FakeProcess)
+    monkeypatch.setattr(web.conversation_manager, "process_factory", FakeProcess)
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
     snapshot = (await client.get("/api/conversation")).json()
-    csrf = (await web.store.session(client.cookies.get(web.COOKIE))).csrf_token
+    csrf = (await web.web_store.session(client.cookies.get(web.COOKIE))).csrf_token
     submitted = await client.post(
         "/api/message", json={"message": "Hi"}, headers={"X-CSRF-Token": csrf}
     )
     assert submitted.status_code == 202
-    user = (await web.store.user_by_google_sub("sub-a")).user_id
-    conversation = web.chat.get(user)
+    user = (await web.web_store.user_by_google_sub("sub-a")).user_id
+    conversation = web.conversation_manager.get(user)
     conversation.process.text("<script>alert(1)</script>")
     conversation.process.finish()
     await conversation.close()
@@ -353,7 +427,7 @@ async def test_stream_replays_events_after_snapshot(web, monkeypatch):
 @pytest.mark.parametrize("operation", ["database", "google", "chat"])
 async def test_slow_operations_allow_health_checks_and_loop_progress(web, monkeypatch, operation):
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
-    session = await web.store.session(client.cookies.get(web.COOKIE))
+    session = await web.web_store.session(client.cookies.get(web.COOKIE))
     started = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
@@ -365,7 +439,7 @@ async def test_slow_operations_allow_health_checks_and_loop_progress(web, monkey
         return credentials() if operation == "google" else {"conversation_id": "chat"}
 
     if operation == "database":
-        original = web.store.session
+        original = web.web_store.session
 
         async def slow_session(token):
             started.set()
@@ -373,7 +447,7 @@ async def test_slow_operations_allow_health_checks_and_loop_progress(web, monkey
                 await asyncio.sleep(0)
             return await original(token)
 
-        monkeypatch.setattr(web.store, "session", slow_session)
+        monkeypatch.setattr(web.web_store, "session", slow_session)
         request = client.get("/")
     elif operation == "google":
         await client.get("/auth/google/start", follow_redirects=False)
@@ -386,7 +460,7 @@ async def test_slow_operations_allow_health_checks_and_loop_progress(web, monkey
                 await asyncio.sleep(0)
             return {"conversation_id": "chat"}
 
-        monkeypatch.setattr(web.chat, "submit", slow_chat)
+        monkeypatch.setattr(web.conversation_manager, "submit", slow_chat)
         request = client.post(
             "/api/message", json={"message": "Hi"}, headers={"X-CSRF-Token": session.csrf_token}
         )
@@ -406,7 +480,7 @@ async def test_slow_operations_allow_health_checks_and_loop_progress(web, monkey
 
 
 async def test_refresh_does_not_recreate_disconnected_user(web, monkeypatch):
-    user_id = await web.store.save_credentials("sub-a", "a@example.com", credentials())
+    user_id = await web.web_store.save_credentials("sub-a", "a@example.com", credentials())
     monkeypatch.setattr(Credentials, "valid", property(lambda self: False))
     started = asyncio.Event()
     release = threading.Event()
@@ -419,35 +493,35 @@ async def test_refresh_does_not_recreate_disconnected_user(web, monkeypatch):
         self.token = "new-token"
 
     monkeypatch.setattr(Credentials, "refresh", refresh)
-    task = asyncio.create_task(web.store.load_refreshed(user_id))
+    task = asyncio.create_task(web.web_store.load_refreshed(user_id))
     try:
         await asyncio.wait_for(started.wait(), timeout=2)
-        assert web.store.factory.kw["bind"].pool.checkedout() == 0
-        await web.store.disconnect(user_id)
+        assert web.web_store.factory.kw["bind"].pool.checkedout() == 0
+        await web.web_store.disconnect(user_id)
     finally:
         release.set()
     assert await asyncio.wait_for(task, timeout=2) is None
-    assert await web.store.user_by_google_sub("sub-a") is None
+    assert await web.web_store.user_by_google_sub("sub-a") is None
 
 
 async def test_failed_rotation_rolls_back_deletion(web, monkeypatch):
-    old_token, _ = await web.store.new_session()
-    conflicting_token, _ = await web.store.new_session()
-    user_id = await web.store.save_credentials("sub-a", "a@example.com", credentials())
+    old_token, _ = await web.web_store.new_session()
+    conflicting_token, _ = await web.web_store.new_session()
+    user_id = await web.web_store.save_credentials("sub-a", "a@example.com", credentials())
     monkeypatch.setattr(
         "assistant_agent.web_store.secrets.token_urlsafe", lambda size: conflicting_token
     )
     with pytest.raises(IntegrityError):
-        await web.store.rotate(old_token, user_id)
-    assert await web.store.session(old_token) is not None
-    assert web.store.factory.kw["bind"].pool.checkedout() == 0
+        await web.web_store.rotate(old_token, user_id)
+    assert await web.web_store.session(old_token) is not None
+    assert web.web_store.factory.kw["bind"].pool.checkedout() == 0
 
 
 async def test_cancelled_transaction_rolls_back_and_releases_connection(web):
     started = asyncio.Event()
 
     async def transaction():
-        async with web.store.factory.begin() as db:
+        async with web.web_store.factory.begin() as db:
             db.add(
                 WebSession(
                     id="cancelled",
@@ -465,16 +539,16 @@ async def test_cancelled_transaction_rolls_back_and_releases_connection(web):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    async with web.store.factory() as db:
+    async with web.web_store.factory() as db:
         assert await db.get(WebSession, "cancelled") is None
-    assert web.store.factory.kw["bind"].pool.checkedout() == 0
+    assert web.web_store.factory.kw["bind"].pool.checkedout() == 0
 
 
 async def test_stream_closes_when_authentication_expires(web, monkeypatch):
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
     token = client.cookies.get(web.COOKIE)
-    row = await web.store.session(token)
-    conversation = web.chat.get(row.user_id)
+    row = await web.web_store.session(token)
+    conversation = web.conversation_manager.get(row.user_id)
     request = Request(
         {
             "type": "http",
@@ -486,20 +560,22 @@ async def test_stream_closes_when_authentication_expires(web, monkeypatch):
     )
     monkeypatch.setattr(request, "is_disconnected", AsyncMock(return_value=False))
     monkeypatch.setattr(web.module, "HEARTBEAT_SECONDS", 0)
-    response = await web.module.conversation_stream(request, conversation.id)
+    response = await web.module.conversation_stream(
+        request, conversation.id, web.web_store, web.conversation_manager
+    )
     assert await anext(response.body_iterator) == ": heartbeat\n\n"
-    async with web.store.factory.begin() as db:
+    async with web.web_store.factory.begin() as db:
         expired = await db.get(WebSession, row.id)
         expired.expires_at = utcnow() - timedelta(seconds=1)
     with pytest.raises(StopAsyncIteration):
         await anext(response.body_iterator)
-    assert web.store.factory.kw["bind"].pool.checkedout() == 0
+    assert web.web_store.factory.kw["bind"].pool.checkedout() == 0
 
 
 async def test_stream_respects_last_event_id(web, monkeypatch):
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")
-    user = await web.store.user_by_google_sub("sub-a")
-    conversation = web.chat.get(user.user_id)
+    user = await web.web_store.user_by_google_sub("sub-a")
+    conversation = web.conversation_manager.get(user.user_id)
     conversation.emit("assistant_delta", text="already-seen")
     await conversation.close()
     response = await client.get(
@@ -524,7 +600,7 @@ async def test_failed_startup_closes_chat_and_disposes_engine(web, monkeypatch):
     monkeypatch.setattr(
         web.module, "make_async_engine", lambda url: SimpleNamespace(dispose=dispose)
     )
-    monkeypatch.setattr(web.module, "make_async_session_factory", lambda engine: web.store.factory)
+    monkeypatch.setattr(web.module, "make_async_session_factory", lambda engine: web.web_store.factory)
 
     async def fail_start():
         raise RuntimeError("startup failed")
@@ -536,8 +612,8 @@ async def test_failed_startup_closes_chat_and_disposes_engine(web, monkeypatch):
         async with application.router.lifespan_context(application):
             pytest.fail("Failed startup must not yield")
     assert close.is_set()
-    assert application.state.gmail._closed
-    assert application.state.gmail.worker is application.state.google_worker
+    assert application.state.gmail_service._closed
+    assert application.state.gmail_service.worker is application.state.google_worker
     dispose.assert_awaited_once()
 
 
@@ -546,7 +622,7 @@ async def test_shutdown_disposes_engine_even_if_chat_close_fails(web, monkeypatc
     monkeypatch.setattr(
         web.module, "make_async_engine", lambda url: SimpleNamespace(dispose=dispose)
     )
-    monkeypatch.setattr(web.module, "make_async_session_factory", lambda engine: web.store.factory)
+    monkeypatch.setattr(web.module, "make_async_session_factory", lambda engine: web.web_store.factory)
 
     async def fail_close():
         raise RuntimeError("cleanup failed")
@@ -558,7 +634,7 @@ async def test_shutdown_disposes_engine_even_if_chat_close_fails(web, monkeypatc
         async with application.router.lifespan_context(application):
             pass
     dispose.assert_awaited_once()
-    assert application.state.gmail._closed
+    assert application.state.gmail_service._closed
 
 
 async def test_postgres_async_driver_transactions_and_disposal(web):
@@ -623,3 +699,25 @@ async def test_postgres_async_driver_transactions_and_disposal(web):
             old_pool = engine.pool
             await engine.dispose()
             assert engine.pool is not old_pool
+
+
+async def test_disconnect_deletes_credentials_and_sessions_when_docker_cleanup_fails(
+    web, monkeypatch
+):
+    client = await connect(web, monkeypatch, "sub-a", "a@example.com")
+    token = client.cookies.get(web.COOKIE)
+    session = await web.web_store.session(token)
+    user_id = session.user_id
+    await web.conversation_manager.submit(user_id, "one")
+    handle = web.conversation_manager.sandbox_service.allocated[0]
+    monkeypatch.setattr(web.module, "revoke", lambda creds: True)
+    web.conversation_manager.sandbox_service.destroy = AsyncMock(side_effect=RuntimeError("Docker unavailable"))
+    response = await client.post(
+        "/disconnect", data={"csrf_token": session.csrf_token}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert user_id not in web.conversation_manager.conversations
+    assert await web.web_store.load_credentials(user_id) is None
+    assert await web.web_store.session(token) is None
+    assert await web.web_store.user_by_google_sub("sub-a") is None
+    web.conversation_manager.sandbox_service.destroy.assert_awaited_once_with(handle)
