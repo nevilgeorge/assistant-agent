@@ -259,7 +259,12 @@ class GmailMCP:
             cursor: Annotated[str, Field(strict=True, min_length=1, max_length=24 * 1024)]
             | None = None,
         ) -> dict[str, Any]:
-            """Search Gmail, one page at a time. Follow cursor; partial results are not exhaustive."""
+            """
+            Search Gmail, one page at a time. Follow cursor; partial results are not exhaustive.
+            Gmail search syntax, as used in Gmail’s search box.
+            Examples: from:alice@example.com, subject:invoice, after:2026/01/01 before:2026/02/01, or has:attachment.
+            Combine filters to narrow results; broaden the query if relevant messages may have been missed.
+            """
             return await self._run(
                 "search_emails",
                 context,

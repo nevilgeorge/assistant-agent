@@ -79,7 +79,7 @@
 </section>
 </div>
 
-<script src="{{ url_for('static', path='vendor/markdown-it-14.1.0.min.js') }}"></script>
+<script src="{{ url_for('static', path='vendor/markdown-it-14.1.0.min.js').path }}"></script>
 <script>
 const markdown = window.markdownit({html: false, breaks: true, linkify: true});
 const form = document.getElementById("message-form");

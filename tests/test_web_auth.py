@@ -452,6 +452,32 @@ async def test_stream_replays_events_after_snapshot(web, monkeypatch):
     assert "markdown-it" in parser.text
 
 
+@pytest.mark.parametrize("forwarded_https", [False, True], ids=["local-http", "https-proxy"])
+@pytest.mark.parametrize("root_path", ["", "/assistant"], ids=["root", "mounted"])
+async def test_markdown_script_uses_same_origin_path(
+    web, monkeypatch, forwarded_https: bool, root_path: str,
+) -> None:
+    """Serve the parser over the browser's scheme despite an internal HTTP request."""
+    authenticated_client = await connect(web, monkeypatch, "sub-a", "a@example.com")
+    headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "assistant.example"} if (
+        forwarded_https
+    ) else {}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=web.app, root_path=root_path),
+        base_url="http://localhost:8000",
+        cookies=authenticated_client.cookies,
+        headers=headers,
+    ) as client:
+        response = await client.get("/")
+        assert response.status_code == 200
+        assert "a@example.com" in response.text
+        script_path = f"{root_path}/static/vendor/markdown-it-14.1.0.min.js"
+        assert f'<script src="{script_path}"></script>' in response.text
+        parser = await client.get(script_path)
+        assert parser.status_code == 200
+        assert "markdown-it" in parser.text
+
+
 @pytest.mark.parametrize("operation", ["database", "google", "chat"])
 async def test_slow_operations_allow_health_checks_and_loop_progress(web, monkeypatch, operation):
     client = await connect(web, monkeypatch, "sub-a", "a@example.com")

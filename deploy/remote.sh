@@ -72,7 +72,9 @@ docker compose --env-file .env up -d --wait --wait-timeout 180 db
 docker compose --env-file .env run --rm app alembic upgrade head
 # Retire the former Compose-managed sandbox as an orphan; old workspace files stay unused.
 docker compose --env-file .env up -d --remove-orphans app caddy
-for attempt in $(seq 1 30); do
+# Allow the app to initialize before the first HTTPS readiness probe.
+sleep 5
+for attempt in $(seq 1 20); do
   if curl -fsS "https://$DOMAIN/healthz" >/dev/null; then
     # Reclaim the untagged images left behind by this deploy. Dangling only: this never
     # removes a tagged image or one a container references.
