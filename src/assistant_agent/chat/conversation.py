@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from assistant_agent import sandbox
 
+from . import debug_logging
 from .claude_process import ClaudeProcess
 
 if TYPE_CHECKING:
@@ -54,6 +56,10 @@ class Conversation:
         self.is_starting: bool = False
         self.has_failed: bool = False
         self.claude_process: ClaudeProcess | None = None
+        self.debug_stream_enabled: bool = (
+            os.getenv("CLAUDE_DEBUG_STREAM", "") in {"true", "1"}
+            and os.getenv("APP_ENV", "").strip() != "production"
+        )
         self.turn_timeout_handle: asyncio.TimerHandle | None = None
         self.last_activity_monotonic: float = time.monotonic()
         self.transcript_size_bytes: int = 0
@@ -134,10 +140,27 @@ class Conversation:
         """Handle output for an active turn and request cleanup on failure."""
         if not self.active_turn_id or self.has_failed:
             return
+        if self.debug_stream_enabled and message.get("type") in {"assistant", "user"}:
+            message_payload = message.get("message")
+            if isinstance(message_payload, dict):
+                self._debug_log_content(message["type"], message_payload.get("content", []))
         self._receive(message)
         process = self.claude_process if self.has_failed else None
         if process:
             self.request_close()
+
+    def _debug_log_content(self, kind: str, content: Any) -> None:
+        """Log completed content before UI filtering with the active turn's tags."""
+        process = self.claude_process
+        if process is None or not self.debug_stream_enabled:
+            return
+        debug_logging.emit_debug_record({
+            "conversation_id": self.conversation_id,
+            "container_id": process.sandbox_handle.container_id,
+            "turn_id": self.active_turn_id,
+            "stream": "stdout",
+            "event": {"type": kind, "content": content},
+        })
 
     def _receive(self, message: dict) -> None:
         """Translate Claude messages into text deltas and turn results."""
@@ -146,18 +169,19 @@ class Conversation:
             event = message.get("event", {})
             delta = event.get("delta", {})
             if event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
-                self.append(delta.get("text", ""))
+                self.append_assistant_text(delta.get("text", ""))
                 self.has_streamed_turn_text = True
         elif kind == "assistant" and not self.has_streamed_turn_text:
             for block in message.get("message", {}).get("content", []):
                 if block.get("type") == "text":
-                    self.append(block.get("text", ""))
+                    self.append_assistant_text(block.get("text", ""))
         elif kind == "result":
             if message.get("is_error") or message.get("subtype") != "success":
                 self._fail("The assistant could not complete the turn. Start a new conversation.")
                 return
             if not self.transcript_messages[-1]["text"] and message.get("result"):
-                self.append(message["result"])
+                self._debug_log_content("assistant", [{"type": "text", "text": message["result"]}])
+                self.append_assistant_text(message["result"])
             if self.has_failed:
                 return
             self.turn_timeout_handle.cancel()
@@ -170,7 +194,7 @@ class Conversation:
             self.active_turn_id = None
             self.last_activity_monotonic = time.monotonic()
 
-    def append(self, text: str) -> None:
+    def append_assistant_text(self, text: str) -> None:
         """Append assistant text and emit a delta within the transcript limit."""
         if self.has_failed:
             return

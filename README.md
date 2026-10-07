@@ -86,6 +86,21 @@ export SANDBOX_HOST_INPUT_ROOT="$(pwd -P)/data/session-inputs"
 
 Use `docker compose ps` to inspect services and `docker compose logs app` for diagnostics. Stop with `docker compose down`, which preserves database data. Ending a conversation discards its sandbox files. Set `DATABASE_URL` for the host if you run migrations outside Docker.
 
+`deploy/local.sh` enables completed Claude message logging by default. View the app container's
+logs in OrbStack (select the app container and open its logs), or follow them with
+`docker compose logs -f app`. Each JSON record includes the conversation ID,
+container ID, and stream. Completed assistant and user messages include a turn ID
+and the full content array: response text, tool calls/results, and any thinking
+emitted by Claude. Streaming deltas, stderr diagnostics, control messages, and
+initialization/configuration events are excluded. Successful result text is logged
+only when used as a fallback for an empty response. Interrupted
+content without a completed message is omitted. Full content can include sensitive
+data.
+
+Disable it with `CLAUDE_DEBUG_STREAM=false ./deploy/local.sh` (or use `0`). Direct
+app and Compose launches default to disabled; set `CLAUDE_DEBUG_STREAM=true` or `1`
+to enable them. Debug logging is always disabled when `APP_ENV=production`.
+
 ### Agent kit
 
 Each export directory carries a `CLAUDE.md` explaining the format to an assistant
@@ -308,7 +323,9 @@ settings, then run:
 CHAT_DOCKER_INTEGRATION=1 uv run pytest -q tests/test_chat.py -k real_claude
 ```
 
-This makes real model requests. Normal tests use a fake Claude process and do not
-require Docker or provider credentials. Production SSE/proxy behavior must also be
+This makes real model requests and verifies completed content reaches app stderr
+with conversation and turn tags, without raw streaming records. Normal tests use a
+fake Claude process and do not require Docker or provider credentials. Production
+SSE/proxy behavior must also be
 checked after deploying: confirm incremental text, reload/reconnect, and safe plain-text
 rendering.

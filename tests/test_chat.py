@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import os
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +14,7 @@ from aiodocker.stream import Message
 
 from assistant_agent import chat, sandbox
 from assistant_agent.chat import ChatError, ConversationManager, constants
+from assistant_agent.chat import debug_logging
 
 
 class FakeSandbox:
@@ -436,7 +439,16 @@ async def test_startup_failure_or_cancellation_releases_attachment(cancel):
 
 
 @pytest.mark.skipif(os.getenv("CHAT_DOCKER_INTEGRATION") != "1", reason="Opt-in real Claude test")
-async def test_real_claude_multiple_turns():
+async def test_real_claude_multiple_turns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify two real turns stream to the UI and log completed content to stderr."""
+    monkeypatch.setenv("CLAUDE_DEBUG_STREAM", "true")
+    monkeypatch.setenv("APP_ENV", "development")
+    debug_logger = logging.Logger("test.real_claude_debug", level=logging.INFO)
+    debug_logger.addHandler(logging.StreamHandler(sys.stderr))
+    debug_logger.propagate = False
+    monkeypatch.setattr(debug_logging, "_get_debug_logger", lambda: debug_logger)
     manager = ConversationManager()
     try:
         await manager.start()
@@ -456,6 +468,18 @@ async def test_real_claude_multiple_turns():
         assert not conversation.has_failed and conversation.claude_process is process
         assert "cobalt" in conversation.transcript_messages[-1]["text"].lower()
         assert any(e["type"] == "assistant_delta" for e in conversation.replay_events)
+        records = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+        content_records = [record for record in records if record["stream"] == "stdout"]
+        assert content_records
+        assert all(record["event"]["type"] in {"assistant", "user"}
+                   for record in content_records)
+        assert all(record["conversation_id"] == conversation.conversation_id
+                   and record["container_id"] == process.sandbox_handle.container_id
+                   and record["turn_id"] for record in content_records)
+        assert len({record["turn_id"] for record in content_records}) == 2
+        assert any("cobalt" in block.get("text", "").lower()
+                   for record in content_records for block in record["event"]["content"]
+                   if block["type"] == "text")
         await manager.reset("integration")
         assert process.is_closed
         assert not (await process.execution.inspect())["Running"]

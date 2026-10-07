@@ -25,6 +25,7 @@ services:
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
       DATABASE_URL: postgresql+psycopg://assistant_agent:${POSTGRES_PASSWORD}@db:5432/assistant_agent
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_DEBUG_STREAM: ${CLAUDE_DEBUG_STREAM:-false}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-assistant-agent-sandbox:local}
       SANDBOX_DEPLOYMENT_ID: ${SANDBOX_DEPLOYMENT_ID:-local}
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-assistant-agent-local-sandboxes}

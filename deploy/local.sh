@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export SANDBOX_HOST_INPUT_ROOT="$(pwd -P)/data/session-inputs"
+export CLAUDE_DEBUG_STREAM="${CLAUDE_DEBUG_STREAM:-true}"
 
 for executable in docker python3 curl; do
   command -v "$executable" >/dev/null || { echo "Missing required command: $executable" >&2; exit 1; }
