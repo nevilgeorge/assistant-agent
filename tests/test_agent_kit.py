@@ -44,8 +44,7 @@ def test_install_creates_exactly_the_kit(tmp_path: Path) -> None:
 def test_installed_modes(tmp_path: Path) -> None:
     install_agent_kit(tmp_path)
     assert _mode_of(tmp_path / "calendar") == DIR_MODE
-    assert _mode_of(tmp_path / "emails") == DIR_MODE
-    assert _mode_of(tmp_path / "emails" / "CLAUDE.md") == DOC_MODE
+    assert _mode_of(tmp_path / "CLAUDE.md") == DOC_MODE
     for relpath in RELPATHS:
         if relpath.endswith(".py"):
             assert _mode_of(tmp_path / relpath) & stat.S_IXUSR, relpath
@@ -86,18 +85,18 @@ def test_install_is_idempotent(tmp_path: Path) -> None:
 
 def test_local_edit_is_reported_and_preserved(tmp_path: Path) -> None:
     install_agent_kit(tmp_path)
-    edited = tmp_path / "emails" / "CLAUDE.md"
+    edited = tmp_path / "CLAUDE.md"
     edited.write_bytes(edited.read_bytes() + b"\nlocal note\n")
     keep = edited.read_bytes()
 
-    assert _states(tmp_path)["emails/CLAUDE.md"] == "modified"
+    assert _states(tmp_path)["CLAUDE.md"] == "modified"
 
     report = install_agent_kit(tmp_path)
-    assert {"relpath": "emails/CLAUDE.md", "state": "modified"} in report["skipped"]
+    assert {"relpath": "CLAUDE.md", "state": "modified"} in report["skipped"]
     assert edited.read_bytes() == keep  # not clobbered
 
     install_agent_kit(tmp_path, force=True)
-    assert edited.read_bytes() == rendered_bytes("emails/CLAUDE.md")
+    assert edited.read_bytes() == rendered_bytes("CLAUDE.md")
 
 
 def test_stale_source_is_reinstalled(tmp_path: Path) -> None:
@@ -116,13 +115,12 @@ def test_stale_source_is_reinstalled(tmp_path: Path) -> None:
 
 def test_preexisting_file_without_manifest_is_unmanaged(tmp_path: Path) -> None:
     # The state the real data/ directory was in before this change existed.
-    (tmp_path / "emails").mkdir()
-    (tmp_path / "emails" / "CLAUDE.md").write_text("hand written")
+    (tmp_path / "CLAUDE.md").write_text("hand written")
 
-    assert _states(tmp_path)["emails/CLAUDE.md"] == "unmanaged"
+    assert _states(tmp_path)["CLAUDE.md"] == "unmanaged"
     report = install_agent_kit(tmp_path)
-    assert {"relpath": "emails/CLAUDE.md", "state": "unmanaged"} in report["skipped"]
-    assert (tmp_path / "emails" / "CLAUDE.md").read_text() == "hand written"
+    assert {"relpath": "CLAUDE.md", "state": "unmanaged"} in report["skipped"]
+    assert (tmp_path / "CLAUDE.md").read_text() == "hand written"
 
 
 def test_dry_run_writes_nothing(tmp_path: Path) -> None:
@@ -132,7 +130,7 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
 
 
 def test_kit_files_table_matches_disk() -> None:
-    """A sixth file must be wired in deliberately, not silently omitted from exports."""
+    """New kit files must be wired in deliberately, not silently omitted from exports."""
     on_disk = {
         str(p.relative_to(AGENT_KIT_DIR))
         for p in AGENT_KIT_DIR.rglob("*")
@@ -183,7 +181,7 @@ def test_installed_calendar_indexer_runs(tmp_path: Path) -> None:
 def test_check_exit_code(tmp_path: Path, drift: bool) -> None:
     install_agent_kit(tmp_path)
     if drift:
-        target = tmp_path / "emails" / "CLAUDE.md"
+        target = tmp_path / "CLAUDE.md"
         target.write_bytes(target.read_bytes() + b"\nedited\n")
 
     args = argparse.Namespace(output=str(tmp_path), check=True, force=False)

@@ -27,19 +27,6 @@ GMAIL_TOOLS = frozenset({
 LOCAL_APPROVALS = ["Read(//input/**)", "Bash(ls *)", "Bash(rg *)"]
 DISCOVERY_SECONDS = 10
 STATUS_POLL_SECONDS = 0.25
-GMAIL_GUIDANCE = (
-    "Use Gmail search to find messages, then get_email or get_thread for details. "
-    "Download only explicitly selected message IDs or attachment IDs with the Gmail download tools. "
-    "Follow pagination cursors when needed and report truncation and partial failures. "
-    "Local Read, ls, and rg searches cover downloaded files under /input only, not the mailbox. "
-    "Python and other unapproved commands are unavailable."
-)
-UNAVAILABLE_GUIDANCE = (
-    "Gmail is unavailable in this conversation. Reset to retry. "
-    "Do not claim to have searched or retrieved Gmail. Local Read, ls, and rg can inspect "
-    "existing downloaded files under /input only. Python and other unapproved commands "
-    "are unavailable."
-)
 
 
 class GmailUnavailable(RuntimeError):
@@ -64,6 +51,8 @@ class ClaudeProcess:
         "--include-partial-messages",
         "--no-session-persistence",
         "--restricted",
+        "--append-system-prompt-file",
+        "/workspace/CLAUDE.md",
         "--tools",
         "Read,Glob,Grep,Bash",
         "--add-dir",
@@ -107,8 +96,6 @@ class ClaudeProcess:
             launch_argv += sorted(GMAIL_TOOLS)
         else:
             launch_argv += ["--disallowedTools", "mcp__*"]
-        launch_argv += ["--append-system-prompt",
-                        GMAIL_GUIDANCE if gmail_enabled else UNAVAILABLE_GUIDANCE]
         environment = {"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
                        "MCP_TIMEOUT": "10000"}
         if gmail_enabled:

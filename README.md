@@ -279,6 +279,28 @@ application uses aiodocker's public stream API; its protocol and transcript limi
 remain 2 MiB. Docker frame allocation belongs to aiodocker, which does not impose
 the old application's 16 MiB frame header limit.
 
+After container readiness, allocation copies the exact packaged
+`agent_kit/CLAUDE.md` to `/workspace/CLAUDE.md` through Docker's archive API,
+owned by root with mode 0644. Read or upload failures fail allocation and trigger
+cleanup. Provisioning uses the existing allocation deadline. Each container receives one copy;
+Gmail fallback reuses it, and reset provisions the current packaged version in a
+new container. The workspace stays agent-owned and writable, while `/input`
+stays read-only. The installer and sandbox image do not supply this file.
+
+Claude Code 2.1.292 did not automatically load a synthetic instruction from this
+file with the production `--restricted` flags. Both Gmail and chat-only launches
+therefore use `--append-system-prompt-file /workspace/CLAUDE.md`; real model checks
+verified the synthetic instruction was loaded without reading it through a tool.
+Repeat the context check against the configured built image with:
+
+```bash
+CLAUDE_CONTEXT_INTEGRATION=1 uv run pytest -q -s tests/test_claude_context_integration.py
+```
+
+This makes two real model requests and also verifies exact file content,
+ownership, readability, replacement within the writable workspace, and read-only
+input. Existing conversations receive new packaged context after reset.
+
 For the optional two-turn model check, configure the app Anthropic key and sandbox
 settings, then run:
 

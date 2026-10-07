@@ -1,12 +1,12 @@
 """Install the agent kit -- instructions and index tooling -- into an export directory.
 
-The kit teaches an assistant agent how to read a Gmail/Calendar export: a CLAUDE.md
-per export type plus the stdlib-only scripts that build a queryable index over it.
+The kit teaches an assistant agent to use Gmail MCP for email lookup and read
+Calendar exports with instructions and a stdlib-only indexing script.
 The tracked copies beside this module are the source of truth; the copies that land
 in a data directory are generated and may be overwritten.
 
-Installing copies rather than symlinks is deliberate. Both index scripts locate
-themselves with `Path(__file__).resolve().parent`, and `.resolve()` follows symlinks,
+Installing copies rather than symlinks is deliberate. The calendar index script
+locates itself with `Path(__file__).resolve().parent`, and `.resolve()` follows symlinks,
 so a symlinked script would resolve its root to this package directory and index
 nothing -- failing silently with an empty index rather than loudly.
 """
@@ -36,11 +36,9 @@ AGENT_KIT_DIR = Path(__file__).resolve().parent
 # directories too. This table is the reviewable contract for what lands in a user's
 # export directory. tests/test_agent_kit.py asserts it matches what is on disk.
 KIT_FILES: tuple[tuple[str, int], ...] = (
+    ("CLAUDE.md", DOC_MODE),
     ("calendar/CLAUDE.md", DOC_MODE),
     ("calendar/build_index.py", SCRIPT_MODE),
-    ("emails/CLAUDE.md", DOC_MODE),
-    ("emails/build_index.py", SCRIPT_MODE),
-    ("emails/decode_email_bodies.py", SCRIPT_MODE),
 )
 
 _HEADER_LINES = (

@@ -175,6 +175,18 @@ async def test_failed_stream_open_releases_partial_attachment():
 async def test_docker_input_publication_workspace_environment_and_inspection():
     async with sandbox.Sandbox() as service:
         handle = await service.allocate("input-test", uuid.uuid4().hex)
+        from importlib import resources
+
+        context = await service.run("cat /workspace/CLAUDE.md", name=handle.container_id)
+        assert context.ok
+        assert context.output.encode() == resources.files("assistant_agent.agent_kit").joinpath(
+            "CLAUDE.md"
+        ).read_bytes()
+        metadata = await service.run(
+            "stat -c '%u:%g:%a' /workspace/CLAUDE.md; test -r /workspace/CLAUDE.md",
+            name=handle.container_id,
+        )
+        assert metadata.ok and metadata.output.strip() == "0:0:644"
         temporary = handle.app_input_path / "temporary"
         published = handle.app_input_path / "published.txt"
         temporary.write_text("atomic publication")

@@ -6,12 +6,14 @@ import asyncio
 import os
 import io
 import json
+import logging
 import tarfile
 import shlex
 import re
 import shutil
 from pathlib import Path
 from collections.abc import Mapping
+from importlib import resources
 
 from .config import SandboxSettings, get_sandbox_settings
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ ALLOCATION_TIMEOUT_SECONDS = 30
 # The writable, agent-owned workspace lives in the disposable container layer.
 WORKSPACE = "/workspace"
 REQUEST_TIMEOUT_SECONDS = 120
+logger = logging.getLogger(__name__)
 
 
 class SandboxError(RuntimeError):
@@ -219,6 +222,7 @@ class Sandbox:
                     self._assignments[conversation_id] = handle
                     await container.start()
                     await self.readiness(handle.container_id)
+                    await self._provision_context_files(container)
                 return handle
             except BaseException as exc:
                 self._cleanup[conversation_id] = handle
@@ -330,6 +334,24 @@ class Sandbox:
             return {"ok": True, "image": self.settings.image, "network": self.settings.network}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    async def _provision_context_files(self, container: aiodocker.containers.DockerContainer) -> None:
+        """Copy the packaged context once into each ready container's workspace."""
+        try:
+            context_bytes = resources.files("assistant_agent.agent_kit").joinpath(
+                "CLAUDE.md"
+            ).read_bytes()
+            archive_buffer = io.BytesIO()
+            with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
+                context_file = tarfile.TarInfo("CLAUDE.md")
+                context_file.mode = 0o644
+                context_file.uid = context_file.gid = 0
+                context_file.size = len(context_bytes)
+                archive.addfile(context_file, io.BytesIO(context_bytes))
+            await container.put_archive(WORKSPACE, archive_buffer.getvalue())
+        except Exception as exc:
+            logger.warning("Sandbox context provisioning failed")
+            raise SandboxError("Sandbox context provisioning failed.") from exc
 
     async def provision_mcp(self, handle: SandboxHandle, gmail_enabled: bool) -> None:
         """Publish root-owned, secret-free MCP configuration through Docker archive."""

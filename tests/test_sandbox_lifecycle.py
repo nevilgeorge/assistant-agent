@@ -1,8 +1,11 @@
 """Dedicated lifecycle tests use Docker-shaped fakes, never model calls."""
 
 import asyncio
+import io
 import stat
+import tarfile
 import uuid
+from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -26,6 +29,7 @@ class Container(dict):
         self.id = name + "-id"
         self.start = AsyncMock()
         self.delete = AsyncMock()
+        self.put_archive = AsyncMock()
 
 
 @pytest.fixture
@@ -89,7 +93,7 @@ async def test_assignments_input_mounts_and_hardening(lifecycle):
     assert not second.app_input_path.exists()
 
 
-@pytest.mark.parametrize("stage", ["directory", "create", "start", "readiness"])
+@pytest.mark.parametrize("stage", ["directory", "create", "start", "readiness", "context"])
 async def test_failed_allocation_cleans_acquired_resources(lifecycle, monkeypatch, stage):
     service, client, _, _ = lifecycle
     conversation_id = uuid.uuid4().hex
@@ -106,12 +110,107 @@ async def test_failed_allocation_cleans_acquired_resources(lifecycle, monkeypatc
             return container
 
         client.containers.create.side_effect = create
-    else:
+    elif stage == "readiness":
         service.readiness.side_effect = RuntimeError("readiness failed")
+    else:
+        original = client.containers.create.side_effect
+
+        async def create(config, *, name):
+            container = await original(config, name=name)
+            container.put_archive.side_effect = RuntimeError("upload failed")
+            return container
+
+        client.containers.create.side_effect = create
     with pytest.raises(SandboxError, match="allocation"):
         await service.allocate("user", conversation_id)
     assert service.capacity_used == 0
     assert not (service.settings.app_input_root / conversation_id).exists()
+    await service.close()
+
+
+async def test_context_archive_is_exact_and_uploaded_after_readiness(lifecycle):
+    service, _, containers, _ = lifecycle
+
+    async def readiness(container_id: str) -> None:
+        container = containers[container_id]
+        container.start.assert_awaited_once()
+        container.put_archive.assert_not_awaited()
+
+    service.readiness.side_effect = readiness
+    handle = await service.allocate("user", uuid.uuid4().hex)
+    container = containers[handle.container_id]
+    container.put_archive.assert_awaited_once()
+    destination, archive_bytes = container.put_archive.call_args.args
+    assert destination == "/workspace"
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes)) as archive:
+        assert archive.getnames() == ["CLAUDE.md"]
+        member = archive.getmember("CLAUDE.md")
+        assert member.isfile() and member.mode == 0o644
+        assert member.uid == member.gid == 0
+        assert archive.extractfile(member).read() == resources.files(
+            "assistant_agent.agent_kit"
+        ).joinpath("CLAUDE.md").read_bytes()
+    assert not (handle.app_input_path / "CLAUDE.md").exists()
+    await service.close()
+
+
+async def test_context_upload_obeys_allocation_deadline(lifecycle, monkeypatch):
+    service, client, containers, _ = lifecycle
+    monkeypatch.setattr("assistant_agent.sandbox.ALLOCATION_TIMEOUT_SECONDS", 0.05)
+    original = client.containers.create.side_effect
+
+    async def create(config: dict, *, name: str) -> Container:
+        container = await original(config, name=name)
+        container.put_archive.side_effect = stalled_upload
+        return container
+
+    async def stalled_upload(*args) -> None:
+        await asyncio.Event().wait()
+
+    client.containers.create.side_effect = create
+    conversation_id = uuid.uuid4().hex
+    with pytest.raises((SandboxError, TimeoutError)):
+        await service.allocate("user", conversation_id)
+    containers[service._name(conversation_id)].delete.assert_awaited_once_with(force=True)
+    assert service.capacity_used == 0
+    assert not (service.settings.app_input_root / conversation_id).exists()
+    await service.close()
+
+
+async def test_context_read_failure_cleans_up_and_logs_static_error(lifecycle, monkeypatch, caplog):
+    service, _, containers, _ = lifecycle
+    monkeypatch.setattr(
+        "assistant_agent.sandbox.resources.files",
+        lambda _: (_ for _ in ()).throw(OSError("sensitive read details")),
+    )
+    conversation_id = uuid.uuid4().hex
+    with pytest.raises(SandboxError, match="allocation"):
+        await service.allocate("user", conversation_id)
+    container = containers[service._name(conversation_id)]
+    container.put_archive.assert_not_awaited()
+    container.delete.assert_awaited_once_with(force=True)
+    assert service.capacity_used == 0
+    assert not (service.settings.app_input_root / conversation_id).exists()
+    assert "Sandbox context provisioning failed" in caplog.text
+    assert "sensitive read details" not in caplog.text
+    await service.close()
+
+
+async def test_replacement_container_reads_current_packaged_context(lifecycle, monkeypatch, tmp_path):
+    service, _, containers, _ = lifecycle
+    package_path = tmp_path / "package"
+    package_path.mkdir()
+    context_path = package_path / "CLAUDE.md"
+    monkeypatch.setattr("assistant_agent.sandbox.resources.files", lambda _: package_path)
+    conversation_id = uuid.uuid4().hex
+    for context_bytes in (b"first version\n", b"updated version\n"):
+        context_path.write_bytes(context_bytes)
+        handle = await service.allocate("user", conversation_id)
+        container = containers[handle.container_id]
+        container.put_archive.assert_awaited_once()
+        with tarfile.open(fileobj=io.BytesIO(container.put_archive.call_args.args[1])) as archive:
+            assert archive.extractfile("CLAUDE.md").read() == context_bytes
+        await service.destroy(handle)
     await service.close()
 
 

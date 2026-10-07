@@ -87,6 +87,7 @@ async def test_exact_permissions_and_exec_only_token_injection():
     assert "synthetic-grant" not in repr(process.__dict__)
     inner = shlex.split(command)[-1]
     for flag in ("--restricted", "--no-session-persistence", "--strict-mcp-config",
+                 "--append-system-prompt-file /workspace/CLAUDE.md",
                  "--add-dir /input", "--permission-mode dontAsk", "Read,Glob,Grep,Bash"):
         assert flag in inner
     assert "--disallowedTools" not in inner
@@ -100,7 +101,8 @@ async def test_chat_only_has_no_token_and_denies_mcp():
     assert "ASSISTANT_MCP_TOKEN" not in service.exec.call_args.kwargs["environment"]
     command = shlex.split(service.exec.call_args.args[0])[-1]
     assert "--disallowedTools 'mcp__*'" in command
-    assert "Gmail is unavailable in this conversation. Reset to retry." in command
+    assert "--append-system-prompt-file /workspace/CLAUDE.md" in command
+    assert "--append-system-prompt " not in command
     assert not any(name in command for name in claude_process.GMAIL_TOOLS)
     await process.close()
 

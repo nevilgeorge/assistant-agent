@@ -113,8 +113,19 @@ assignment at `/input:ro`. `/workspace` is agent-owned writable scratch in the
 container layer. Container removal discards copied inputs, output, processes,
 and CLI state. Downloads are explicit tool outputs, not a mailbox cache.
 
+Allocation uploads the exact packaged `agent_kit/CLAUDE.md` after readiness and
+before returning, within the allocation deadline. The archive contains only
+`CLAUDE.md`, installed at `/workspace/CLAUDE.md` with root ownership and mode 0644.
+Read/upload failures log a static error and follow allocation cleanup. Fallback
+reuses the existing copy; reset creates a new container with the current packaged
+version. No installer, mount, entrypoint, or sandbox-image change is required.
+
 Claude runs as `agent` in `/workspace` with non-TTY stream-json stdin/stdout,
 `setsid --wait`, restricted mode, and `--no-session-persistence`. Registration uses
+`--append-system-prompt-file /workspace/CLAUDE.md` in both Gmail and chat-only
+launches. A synthetic marker check on Claude Code 2.1.292 found automatic project
+context loading absent with the production restricted flags; the explicit file
+flag loaded the marker in both launch modes without tool use. Registration uses
 strict MCP configuration, `/input` as an additional directory, built-ins
 `Read,Glob,Grep,Bash`, and `dontAsk`. Exact approvals cover the five Gmail tools,
 `Read(//input/**)`, `Bash(ls *)`, and `Bash(rg *)`. Python is unapproved. The legacy

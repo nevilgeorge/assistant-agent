@@ -33,7 +33,7 @@ from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from assistant_agent.agent_kit.emails.build_index import extract_body
+from assistant_agent.gmail_body import extract_body
 from assistant_agent.async_workers import AsyncWorker
 from assistant_agent.web_store import WebStore
 

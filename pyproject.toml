@@ -56,7 +56,6 @@ line-length = 100
 # under whatever interpreter a sandbox provides, so it cannot use 3.11+ spellings
 # that the rest of the package is free to use.
 "src/assistant_agent/agent_kit/calendar/*" = ["UP017"]
-"src/assistant_agent/agent_kit/emails/*" = ["UP017"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
