@@ -1,10 +1,10 @@
 # Gmail MCP and session file access
 
-Status: Phases 1–5 implemented; installed-CLI validation is recorded below. Integrated live-account validation remains phase 6. Last updated: 2026-10-06.
+Status: Phases 1–5 implemented; installed-CLI validation is recorded below. Phase 6 local integrated validation is in progress; live-account evidence remains pending. Last updated: 2026-10-07.
 
 ## Decision and scope
 
-Expose read-only Gmail tools from the assistant-agent app over Streamable HTTP MCP. Claude inside Docker connects directly to the existing app listener over a shared Docker network. Google OAuth credentials, refresh logic, and Gmail API calls remain in the app. Use Gmail search to select messages; let the agent explicitly download selected messages when local `ls`, `rg`, or Python analysis is useful.
+Expose read-only Gmail tools from the assistant-agent app over Streamable HTTP MCP. Claude inside Docker connects directly to the existing app listener over a shared Docker network. Google OAuth credentials, refresh logic, and Gmail API calls remain in the app. Use Gmail search to select messages; let the agent explicitly download selected messages when local Read, `ls`, or `rg` analysis is useful. Python remains unapproved.
 
 Avoid downloading the entire roughly 400 MB mailbox at session startup. That size is manageable, but many small objects, cold-start delay, and unused downloads favor selective retrieval. MCP is the tool interface; Gmail supplies the search index.
 
@@ -95,7 +95,7 @@ Claude discovers tool descriptions and schemas from the endpoint automatically. 
 - Generate a fresh opaque token with `secrets.token_urlsafe(48)` when launching the conversation's agent. Store only `hashlib.sha256(raw_token.encode("utf-8")).hexdigest()`, reusing the existing `web_store.token_hash()` pattern. SHA-256 is appropriate for this high-entropy random token; password hashing and a salt are unnecessary. The stored hash is not a usable bearer credential.
 - Add a separate `SandboxAccessToken` table with `id`, uniquely indexed `token_hash` (`VARCHAR(64)`), `user_id` (foreign key), `conversation_id`, `sandbox_id`, `created_at`, `expires_at`, and nullable `revoked_at`. Do not add the token to `WebSession`: browser-login and agent-conversation lifetimes differ. Initially, the tool allowlist lives in server code, and `conversation_id` is a correlation identifier because conversations are in memory.
 - Pass the raw token as `ASSISTANT_MCP_TOKEN` in the Docker exec environment for the Claude process, not the container-wide environment, image, or shell command. Claude expands it into the MCP Authorization header; descendants may inherit it. Do not log it or persist the raw value in the database.
-- On every request, hash the bearer token, look up the grant, and reject missing, expired, revoked, or inactive-conversation grants. Authorize the requested tool independently of MCP protocol session bookkeeping. Revoke grants on launch failure and conversation teardown, invalidate abandoned grants during restart recovery, and issue a new token when replacing the agent process; hashes cannot recover old tokens.
+- On every request, hash the bearer token, look up the grant, and reject missing, expired, revoked, or inactive-conversation grants. Authorize the requested tool independently of MCP protocol session bookkeeping. Revoke grants on launch failure and conversation teardown, invalidate abandoned grants during restart recovery, and issue a new token for a fresh assigned conversation; hashes cannot recover old tokens. The one chat-only startup replacement receives no grant.
 - Resolve credentials, Gmail `me`, and output directory from that identity. Do not accept user IDs, sandbox IDs, or arbitrary output paths as tool arguments. Keep browser cookies and Google tokens outside the sandbox.
 - Treat the app token as accessible to sandbox code. It permits only this conversation's Gmail operations, never general app or Docker control. Enforce request, concurrency, response-size, and download quotas; sanitize attachment names and prevent path traversal. Exclude secrets and email bodies from routine logs.
 - **Accepted MVP exposure:** the sandbox can reach other routes and listening ports on the shared app interface. Docker service discovery, `expose`, and omitted published ports do not enforce MCP-only access. Existing route authentication remains essential.
@@ -106,7 +106,7 @@ Direct HTTP is the simplest supported transport. A reverse proxy on separate san
 
 ## Development Plan
 
-Use each phase below as the scope for a separate Codex implementation plan. Phases 1–5 are implemented; phase 6 is pending. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4.
+Use each phase below as the scope for a separate Codex implementation plan. Phases 1–5 are implemented; phase 6 local validation is in progress. Include the phase's tests with its implementation; phase 6 verifies the integrated system. Phases 1 and 2 can be implemented independently; phase 3 depends on phase 2, phase 4 on phases 1–3, and phase 5 on phases 2–4.
 
 | Phase | Design sections |
 | --- | --- |
@@ -115,7 +115,7 @@ Use each phase below as the scope for a separate Codex implementation plan. Phas
 | 3. Conversation access tokens | [Authentication and accepted risks](#authentication-and-accepted-risks) |
 | 4. MCP endpoint and downloads | [Tools](#tools), [Gmail API](#gmail-api), [Session lifecycle and files](#session-lifecycle-and-files) |
 | 5. Claude registration and permissions | [MCP registration inside the sandbox](#mcp-registration-inside-the-sandbox) |
-| 6. End-to-end validation and rollout | [Session lifecycle and files](#session-lifecycle-and-files), [MCP registration inside the sandbox](#mcp-registration-inside-the-sandbox), [Authentication and accepted risks](#authentication-and-accepted-risks) |
+| 6. End-to-end validation and operational readiness | [Session lifecycle and files](#session-lifecycle-and-files), [MCP registration inside the sandbox](#mcp-registration-inside-the-sandbox), [Authentication and accepted risks](#authentication-and-accepted-risks) |
 
 ### Phase 1 — Gmail service
 
@@ -307,12 +307,125 @@ same Claude process. Phase 5 is complete. Regression verification: **345 passed,
 default suite. The synthetic check does not claim live-account or deployment
 validation.
 
-### Phase 6 — End-to-end validation and rollout
+### Phase 6 — End-to-end validation and operational readiness
 
-- Exercise authenticated search → preview → retrieval or explicit download → local analysis using a test Google account, including pagination, attachments, OAuth failure, reset, expiry, and app restart.
-- Verify two-user isolation and token revocation across the integrated system. Record actual app, database, other-sandbox, host, and metadata-service reachability alongside the accepted direct-listener/plain-HTTP risks.
-- Measure cold session startup and search latency under concurrent users; tune limits from evidence. Document required configuration, migration/startup order, operational cleanup, and failure diagnostics without email bodies or secrets. Update the existing Docker lifecycle note to match the implemented architecture.
-- **Complete when:** the integrated checks pass in the target Docker setup and deployment instructions are reviewable. Production deployment is a separate explicit action.
+The accepted scope is local full-app validation and operational documentation.
+Use the existing connected app/account for a separate live smoke check of
+the user-selected messages. No known content marker or attachment hash was supplied,
+so label that evidence `live_smoke`, not controlled-fixture validation. No production deployment or database migration
+is part of this phase. Existing revision `0004` must already be applied before
+web lifespan startup, with one app worker/replica per deployment and one deployment
+per database.
+
+- Add an opt-in full-app synthetic suite at `tests/test_gmail_integration.py`,
+  gated by `GMAIL_MCP_INTEGRATION=1`. Exercise authenticated search, preview,
+  retrieval, explicit text/JSON/EML and attachment downloads, local analysis,
+  pagination/partial failures, OAuth failures, degraded startup, and persistent
+  unavailable status through the real app boundary and assigned Docker container.
+- Verify two simultaneous users cannot use each other's grants, conversation
+  state, or mounted files. Cover reset, fixed expiry, disconnect, shutdown/restart,
+  revocation, and resource cleanup. Do not substitute isolated service tests for
+  this integrated evidence.
+- Use `python -m assistant_agent.gmail_validation --smoke --user-id ...
+  --query SELECTED_QUERY --report ...` in the configured app environment for the
+  user-selected existing account. Smoke mode checks bounded search, retrieval and
+  thread identity consistency, attachment identity/byte-count consistency where
+  available, and five sequential live searches. Missing attachments are explicitly
+  uncovered. The report identifies `live_smoke` and omits IDs, headers, content,
+  query, and credentials; it establishes no known-marker or independent-hash
+  integrity claim. Exact text/JSON/EML/attachment integrity belongs to synthetic
+  fixture evidence. A failed or missing live check leaves this phase incomplete.
+- Refresh only the older local shared-sandbox app to the current assigned-container
+  implementation before integrated live verification. Retain the existing
+  credentials database and applied `0004`; do not deploy production or introduce
+  another migration. Controlled-fixture helper mode remains available separately
+  with `--expected-marker` and `--attachment-sha256` instead of `--smoke`.
+- Measure a local baseline at 1, 2, and 4 concurrent users with the existing built
+  image. Record cold startup and search latency, sample count/distribution, errors,
+  resource observations, and test setup. Compare against the current concurrency
+  and startup limits; change limits only if evidence supports it. Local synthetic
+  measurements do not establish live Google quota behavior or production capacity.
+- Audit actual reachable boundaries from assigned containers: app routes,
+  database, other sandbox, Docker host, and metadata service. Record bounded probe
+  results and limitations without retrieving metadata credentials or email content.
+  This is a review of the accepted direct-listener/plain-HTTP architecture, not a
+  network redesign. Route authentication remains essential even where another
+  service is unreachable in the tested setup.
+- Rewrite the [Docker CLI runbook](running-cli-inside-docker.md) to document
+  settings/path mappings, migration/startup order, degraded startup, safe diagnosis
+  of OAuth revocation and Docker failures, and incomplete-cleanup recovery.
+- **Complete when:** the full-app synthetic suite and existing-account live checks
+  pass in the target local Docker setup, performance/reachability evidence is
+  recorded, regression/Ruff checks pass, and the runbook matches the implementation.
+  Production rollout requires a separate explicit instruction.
+
+Phase 6 evidence is partial; the phase remains incomplete:
+
+| Evidence | Result |
+| --- | --- |
+| Full-app synthetic suite | All 5 integration tests passed in 105.90 seconds: all five Claude tools; Read/ls/rg; exact JSON/EML/attachment hashes; pagination and partial metadata/download failures; cursor/query/user isolation; fallback chat/reset/expiry; restart cleanup of seeded orphans. |
+| Existing-account live smoke | Passed at 2026-10-07T14:51:26Z: bounded message/thread consistency and five live searches. No attachment coverage or known marker/hash. Live browser workflow remains pending: no browser provider was available and native Chrome initialization failed. |
+| Pinned image / installed Claude and Codex versions | `sha256:893c76059e11bb7f7898110caf0f829113a429fa9a5f063b1e914d145ac84a1c`; Claude Code 2.1.292, Codex CLI 0.160.1. |
+| 1/2/4-user startup/search baseline | Completed in the local synthetic harness; zero operation/sampling errors. Medians and sample counts below. |
+| App/database/other-sandbox/host/metadata reachability | Completed for the local harness only; outcomes below. |
+| Regression/Ruff and cleanup verification | 399 passed, 11 skipped in 4.38 seconds; Ruff passed. Seven existing SQLite deprecation warnings. Helper tests: 47 passed. Docker transport regressions: 9 passed in 1.45 seconds. |
+
+Local synthetic baseline (three rounds per concurrency level). The startup timer
+includes synthetic OAuth connection and the initial message POST returning 202;
+it does not measure container/Claude startup alone:
+
+| Concurrent users | Startup samples | Median connect + initial POST | Search samples | Median search |
+| --- | --- | --- | --- | --- |
+| 1 | 3 | 0.839 s | 15 | 0.019 s |
+| 2 | 6 | 0.878 s | 30 | 0.033 s |
+| 4 | 12 | 0.937 s | 60 | 0.025 s |
+
+There were zero operation or resource-sampling errors. These small synthetic
+samples are a local baseline, not tail-latency guarantees or live Google/production
+capacity measurements. No limits were changed from these results.
+
+Bounded reachability checks from assigned containers observed the app health route
+returning 200 and unauthenticated browser/MCP requests returning 401. Sibling and
+host test listeners were reachable. Backend database DNS did not resolve, while
+host port 5432 was reachable. The metadata-service TCP probe timed out; no metadata
+content or credentials were requested. These observations apply only to the local
+harness network. They confirm that direct app access and host/sibling reachability
+remain accepted exposures; unresolved backend DNS does not imply database isolation
+when the host database port is reachable.
+
+Live service smoke passed at 2026-10-07T14:51:26Z with bounded message/thread
+consistency and five sequential searches taking 0.322, 0.334, 0.312, 0.400, and
+0.360 seconds. The report records `validation_mode: live_smoke` and
+`attachments_covered: false`. No controlled marker or independent attachment hash
+was supplied. **Phase 6 remains incomplete**: live browser workflow and controlled
+live attachment validation remain pending. Synthetic attachment integrity is
+covered, but cannot substitute for those live checks.
+
+The current local app image built successfully, but the existing connected app
+was not restarted: no browser provider was available, and native Chrome failed
+with “Sky Computer Use native pipe startup failed.” No database migration or
+production deployment was performed. The remaining browser step is to refresh
+only the local app using the built image and retained credentials database, then
+verify authenticated live conversation discovery, the selected mail workflow,
+local downloads, reset, and the persistent unavailable notice in a working browser.
+Controlled live attachment validation still requires a known attachment fixture.
+
+Additional Docker transport regressions passed: 9 tests in 1.45 seconds, using an
+existing configured Docker network with isolated test deployment labels/input
+roots. An initial setup attempt failed because the default sandbox network was
+absent; the corrected run used the available network. This verifies transport in
+that setup, not production deployment or live browser behavior.
+
+Run the synthetic suite without rebuilding or resolving npm `latest`:
+
+```bash
+GMAIL_MCP_INTEGRATION=1 uv run pytest -q -s tests/test_gmail_integration.py
+```
+
+Record fresh outcomes in this table and the runbook only after execution. The
+passing synthetic suite and live service smoke do not establish a live browser
+workflow or controlled live attachment integrity, and do not authorize production
+rollout.
 
 Caching, S3 ingestion, warm pools, HTTP batching, gateway/TLS isolation, and broader code-execution permissions remain follow-up work; they are not prerequisites for completing these phases.
 
