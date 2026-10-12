@@ -63,6 +63,7 @@ class SandboxHandle:
     conversation_id: str
     host_input_path: Path
     app_input_path: Path
+    host_daily_logs_path: Path | None = None
 
 
 class Sandbox:
@@ -144,6 +145,9 @@ class Sandbox:
             shutil.rmtree(session)
 
     def _container_config(self, handle: SandboxHandle) -> dict:
+        binds = [f"{handle.host_input_path}:/input:ro"]
+        if handle.host_daily_logs_path is not None:
+            binds.append(f"{handle.host_daily_logs_path}:/daily-logs")
         return {
             "Image": self.settings.image,
             "Cmd": ["sleep", "infinity"],
@@ -155,7 +159,7 @@ class Sandbox:
                 CONVERSATION_LABEL: handle.conversation_id,
             },
             "HostConfig": {
-                "Binds": [f"{handle.host_input_path}:/input:ro"],
+                "Binds": binds,
                 "Init": True,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges:true"],
@@ -180,14 +184,40 @@ class Sandbox:
         if not result.ok:
             raise SandboxError("Sandbox readiness command failed.")
 
-    async def allocate(self, user_id: str, conversation_id: str) -> SandboxHandle:
-        return await asyncio.shield(self._track(self._allocate_with_timeout(user_id, conversation_id)))
+    def _daily_logs_path(self, host_daily_logs_path: Path | None) -> Path | None:
+        """Validate a daily-log bind lexically in the Docker host namespace."""
+        if host_daily_logs_path is None:
+            return None
+        try:
+            path = Path(host_daily_logs_path)
+        except (TypeError, ValueError) as exc:
+            raise SandboxError("Invalid daily-log host path.") from exc
+        root = self.settings.host_user_data_root
+        if (not path.is_absolute() or ".." in path.parts
+                or path == root or not path.is_relative_to(root)):
+            raise SandboxError("Daily-log host path must be a strict descendant of host_user_data_root.")
+        return path
 
-    async def _allocate_with_timeout(self, user_id: str, conversation_id: str) -> SandboxHandle:
+    async def allocate(
+        self, user_id: str, conversation_id: str, *, host_daily_logs_path: Path | None = None,
+    ) -> SandboxHandle:
+        return await asyncio.shield(self._track(self._allocate_with_timeout(
+            user_id, conversation_id, host_daily_logs_path=host_daily_logs_path,
+        )))
+
+    async def _allocate_with_timeout(
+        self, user_id: str, conversation_id: str, *, host_daily_logs_path: Path | None = None,
+    ) -> SandboxHandle:
         async with asyncio.timeout(ALLOCATION_TIMEOUT_SECONDS):
-            return await self._allocate(user_id, conversation_id)
+            return await self._create_and_provision_sandbox(
+                user_id, conversation_id, host_daily_logs_path=host_daily_logs_path,
+            )
 
-    async def _allocate(self, user_id: str, conversation_id: str) -> SandboxHandle:
+    async def _create_and_provision_sandbox(
+        self, user_id: str, conversation_id: str, *, host_daily_logs_path: Path | None = None,
+    ) -> SandboxHandle:
+        """Reserve capacity, create and provision a container, and clean up on failure."""
+        host_daily_logs_path = self._daily_logs_path(host_daily_logs_path)
         async with self._lock:
             if self.closed or self._closing:
                 raise SandboxError("Sandbox service is closing.")
@@ -205,6 +235,7 @@ class Sandbox:
                 name, user_id, conversation_id,
                 self.settings.host_input_root / conversation_id,
                 self._session_path(conversation_id),
+                host_daily_logs_path,
             )
             # Reserve before any create call, including an ambiguous daemon response.
             self._assignments[conversation_id] = handle
@@ -218,6 +249,7 @@ class Sandbox:
                     handle = SandboxHandle(
                         container.id, user_id, conversation_id,
                         handle.host_input_path, handle.app_input_path,
+                        handle.host_daily_logs_path,
                     )
                     self._assignments[conversation_id] = handle
                     await container.start()

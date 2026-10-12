@@ -6,6 +6,7 @@ import stat
 import tarfile
 import uuid
 from importlib import resources
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -20,6 +21,7 @@ from assistant_agent.sandbox import (
     OWNER_LABEL,
     Sandbox,
     SandboxError,
+    SandboxHandle,
 )
 
 
@@ -67,6 +69,7 @@ async def test_assignments_input_mounts_and_hardening(lifecycle):
     first = await service.allocate("user1", uuid.uuid4().hex)
     second = await service.allocate("user2", uuid.uuid4().hex)
     assert first.container_id != second.container_id
+    assert first.host_daily_logs_path is None
     assert first.host_input_path != second.host_input_path
     assert first.host_input_path == service.settings.host_input_root / first.conversation_id
     assert first.app_input_path == service.settings.app_input_root / first.conversation_id
@@ -91,6 +94,89 @@ async def test_assignments_input_mounts_and_hardening(lifecycle):
     assert service.capacity_used == 1 and not first.app_input_path.exists()
     await service.close()
     assert not second.app_input_path.exists()
+
+
+def test_handle_preserves_positional_constructor() -> None:
+    handle = SandboxHandle("container", "user", "conversation", Path("/host"), Path("/app"))
+    assert handle.host_daily_logs_path is None
+
+
+async def test_daily_logs_mount_is_forwarded_and_not_prepared(lifecycle):
+    service, _, _, configs = lifecycle
+    # The host directory need not be visible, or exist, in the app namespace.
+    daily_logs_path = service.settings.host_user_data_root / uuid.uuid4().hex / "daily-logs"
+    assert not daily_logs_path.exists()
+    handle = await service.allocate(
+        "user", uuid.uuid4().hex, host_daily_logs_path=str(daily_logs_path),
+    )
+    assert handle.host_daily_logs_path == daily_logs_path
+    assert configs[0]["HostConfig"]["Binds"] == [
+        f"{handle.host_input_path}:/input:ro", f"{daily_logs_path}:/daily-logs",
+    ]
+    assert not daily_logs_path.exists()
+    await service.close()
+
+
+@pytest.mark.parametrize("invalid_path", [
+    "relative/daily-logs", "/", "{root}", "{root}/../elsewhere",
+    "{root}-sibling/user/daily-logs", "/outside/user/daily-logs",
+])
+async def test_daily_logs_path_rejection_precedes_side_effects(lifecycle, invalid_path):
+    service, client, _, _ = lifecycle
+    path = invalid_path.format(root=service.settings.host_user_data_root)
+    before = set(service.settings.app_input_root.iterdir())
+    with pytest.raises(SandboxError, match="Daily-log host path"):
+        await service.allocate("user", uuid.uuid4().hex, host_daily_logs_path=Path(path))
+    assert not service._clients
+    assert service.capacity_used == 0
+    assert set(service.settings.app_input_root.iterdir()) == before
+    client.containers.list.assert_not_awaited()
+    client.containers.create.assert_not_awaited()
+    await service.close()
+
+
+async def test_daily_logs_host_validation_does_not_resolve_symlinks(lifecycle, tmp_path):
+    service, _, _, configs = lifecycle
+    host_root = tmp_path.parent / f"{tmp_path.name}-host-data"
+    host_root.symlink_to(tmp_path, target_is_directory=True)
+    service.settings = replace(service.settings, host_user_data_root=host_root)
+    daily_logs_path = host_root / "user" / "daily-logs"
+    handle = await service.allocate("user", uuid.uuid4().hex, host_daily_logs_path=daily_logs_path)
+    assert handle.host_daily_logs_path == daily_logs_path
+    assert configs[0]["HostConfig"]["Binds"][-1] == f"{daily_logs_path}:/daily-logs"
+    assert not daily_logs_path.exists()
+    await service.close()
+
+
+@pytest.mark.parametrize("cleanup", ["failed_allocation", "destroy", "reconcile"])
+async def test_daily_logs_survive_sandbox_cleanup(lifecycle, tmp_path, cleanup):
+    service, client, _, _ = lifecycle
+    user_data_root = tmp_path.parent / f"{tmp_path.name}-user-data"
+    service.settings = replace(service.settings, host_user_data_root=user_data_root)
+    daily_logs_path = user_data_root / "user" / "daily-logs"
+    daily_logs_path.mkdir(parents=True)
+    daily_log = daily_logs_path / "2026-10-12.md"
+    daily_log.write_text("preserve this entry")
+    daily_log.chmod(0o640)
+    conversation_id = uuid.uuid4().hex
+    if cleanup == "failed_allocation":
+        service.readiness.side_effect = RuntimeError("not ready")
+        with pytest.raises(SandboxError, match="allocation"):
+            await service.allocate("user", conversation_id, host_daily_logs_path=daily_logs_path)
+    else:
+        handle = await service.allocate(
+            "user", conversation_id, host_daily_logs_path=daily_logs_path,
+        )
+        if cleanup == "destroy":
+            await service.destroy(handle)
+        else:
+            client.containers.list.return_value = [await client.containers.get(handle.container_id)]
+            await service.reconcile()
+    assert not (service.settings.app_input_root / conversation_id).exists()
+    assert service.capacity_used == 0
+    assert daily_log.read_text() == "preserve this entry"
+    assert stat.S_IMODE(daily_log.stat().st_mode) == 0o640
+    await service.close()
 
 
 @pytest.mark.parametrize("stage", ["directory", "create", "start", "readiness", "context"])
