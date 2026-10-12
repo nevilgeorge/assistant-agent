@@ -10,7 +10,8 @@ Type=exec
 User=root
 ExecStartPre=/usr/local/libexec/assistant-agent/daily-logs-host.sh cleanup
 ExecStartPre=/usr/local/libexec/assistant-agent/daily-logs-host.sh prepare
-ExecStart=/usr/local/bin/s3fs @BUCKET@:/user-data /srv/assistant-agent/s3/user-data -f -o fsname=@BUCKET@:/user-data -o iam_role=auto -o endpoint=@REGION@ -o url=https://s3.@REGION@.amazonaws.com -o allow_other -o uid=1000,gid=10001 -o umask=0007,mp_umask=0007 -o compat_dir -o use_cache=/srv/assistant-agent/s3fs-cache -o check_cache_dir_exist -o ensure_diskfree=1024 -o connect_timeout=10 -o readwrite_timeout=30 -o retries=3 -o dbglevel=warn
+# Explicit fsname disables FUSE 2's default subtype; readiness requires fuse.s3fs.
+ExecStart=/usr/local/bin/s3fs @BUCKET@:/user-data /srv/assistant-agent/s3/user-data -f -o fsname=@BUCKET@:/user-data -o subtype=s3fs -o iam_role=auto -o endpoint=@REGION@ -o url=https://s3.@REGION@.amazonaws.com -o allow_other -o uid=1000,gid=10001 -o umask=0007,mp_umask=0007 -o compat_dir -o use_cache=/srv/assistant-agent/s3fs-cache -o check_cache_dir_exist -o ensure_diskfree=1024 -o connect_timeout=10 -o readwrite_timeout=30 -o retries=3 -o dbglevel=warn
 ExecStartPost=/usr/local/libexec/assistant-agent/daily-logs-host.sh ready
 ExecStopPost=/usr/local/libexec/assistant-agent/daily-logs-host.sh cleanup
 Restart=no

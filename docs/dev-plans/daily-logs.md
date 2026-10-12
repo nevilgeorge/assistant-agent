@@ -131,6 +131,7 @@ executable launched, not that the mount is ready.
 | Parameters | Purpose |
 | --- | --- |
 | `iam_role=auto` | Use the EC2 instance role without storing static credentials. |
+| `fsname`, `subtype=s3fs` | Set the expected bucket/prefix source and `fuse.s3fs` type. FUSE 2 requires the subtype explicitly when `fsname` is supplied. |
 | `endpoint`, HTTPS `url` | Use the bucket's region and encrypted transport. |
 | `allow_other`, UID/GID, masks | Give the sandbox UID 1000 and app GID 10001 read/write access, excluding others. Verify effective permissions with both identities. |
 | `compat_dir` | Support the existing prefix layout uploaded outside s3fs. Verify first mount with the scoped IAM policy. |
@@ -430,10 +431,10 @@ for the new lifecycle; see [simplification validation](simplify-s3fs.md)):
 1. On a disposable AL2023 systemd host, verify the pinned installer and dependencies without
    replacing `curl-minimal`; exercise service failure propagation and boot ordering.
    See [the simplification acceptance matrix](simplify-s3fs.md) for additional migration checks.
-2. `terraform -chdir=terraform/main plan`: review the intended prefix-scoped inline policy.
-   Stop if it also proposes instance replacement (the AMI tracks latest); prepare a reviewed
-   policy-only rollout rather than approving unrelated infrastructure changes.
-3. `terraform apply`.
+2. `terraform -chdir=terraform/main plan -out=/tmp/assistant-agent.tfplan`: review the intended prefix-scoped inline policy.
+   The AMI is pinned through `ami_id`; stop if the plan proposes unexpected instance
+   replacement and review the cause before approving infrastructure changes.
+3. `terraform -chdir=terraform/main apply /tmp/assistant-agent.tfplan`.
 4. `deploy/deploy.sh --setup-s3fs` for first setup; ordinary deployments omit the flag and
    never compile or install packages. Explicit setup allows an extended SSM
    execution/polling window. If polling expires, inspect the invocation status before retrying.

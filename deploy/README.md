@@ -15,6 +15,10 @@ by `INSTANCE_ID`, `ECR_REPOSITORY_URL`, `SANDBOX_ECR_REPOSITORY_URL`, `DATA_VOLU
 or `APPLICATION_DATA_BUCKET_NAME`. `AWS_REGION` defaults to `us-east-1` and `DOMAIN`
 defaults to `assistant.nevilgeorge.me`.
 
+Terraform pins the production AMI with `ami_id`, defaulting to the currently deployed
+Amazon Linux 2023 ARM64 image. AMI upgrades require deliberately changing that value
+and reviewing the instance replacement plan; application deployments use the existing host.
+
 Local startup continues to use the repository's `compose.yaml` and ignored
 `deploy/local-db-password.txt`. The password file is excluded from the Docker build
 context; keep it local.

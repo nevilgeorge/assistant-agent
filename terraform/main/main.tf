@@ -23,8 +23,13 @@ terraform {
 provider "aws" { region = "us-east-1" }
 # Look up the available Availability Zones in the configured AWS region.
 data "aws_availability_zones" "available" { state = "available" }
-# Read AWS’s public SSM parameter for the latest Amazon Linux 2023 ARM64 AMI.
-data "aws_ssm_parameter" "ami" { name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64" }
+# Pin the production AMI so unrelated applies do not replace the running instance.
+# Upgrade deliberately by changing this ID and reviewing the replacement plan.
+variable "ami_id" {
+  description = "Pinned Amazon Linux 2023 ARM64 AMI in us-east-1. Changing it replaces the instance."
+  type        = string
+  default     = "ami-065b1b834d2a83a7a"
+}
 # Look up the AWS account identity used to run Terraform.
 data "aws_caller_identity" "current" {}
 # Define the project name used for resource names and tags.
@@ -246,8 +251,8 @@ resource "aws_ebs_volume" "data" {
 }
 # Launch the EC2 instance that runs the application.
 resource "aws_instance" "app" {
-  # Boot from the Amazon Linux 2023 ARM64 AMI retrieved from SSM.
-  ami = data.aws_ssm_parameter.ami.value
+  # Boot from the explicitly pinned Amazon Linux 2023 ARM64 AMI.
+  ami = var.ami_id
   # Use a burstable ARM-based t4g.medium instance with 2 vCPUs and 4 GiB of memory.
   instance_type = "t4g.medium"
   # Select the public subnet created above.

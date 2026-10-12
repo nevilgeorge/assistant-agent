@@ -83,5 +83,12 @@ acceptance is still required before production rollout:
 | Persistence | App and sandbox identities read/edit logs; independently verify resulting S3 objects. |
 
 Live lifecycle acceptance was deferred at the user’s request on 2026-10-12.
-No disposable Linux systemd/FUSE host acceptance or production rollout is claimed
-by this implementation. A production release remains gated on those checks.
+Production troubleshooting on 2026-10-12 confirmed the pinned AL2023 build and
+successful storage/app startup after adding explicit `subtype=s3fs`: FUSE 2 suppresses
+its default subtype when `fsname` is set. The host mount, storage I/O probe, actual
+app-container probe, database migration, and HTTPS health check passed. Deployment
+also required closing a ten-day-old idle `psql` reader that blocked the migration;
+the close was guarded against write transactions and write locks.
+
+These startup checks do not establish the full acceptance matrix above. Disposable
+Linux failure injection, reboot, and recovery acceptance remain deferred.

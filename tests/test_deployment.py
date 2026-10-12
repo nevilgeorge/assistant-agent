@@ -125,6 +125,10 @@ def test_units_gate_startup_and_disable_automatic_mount_recovery() -> None:
     assert "ExecStartPost=" in mount_unit and "ready" in mount_unit
     assert "assistant-daily-logs-prepare.service" not in mount_unit
     assert "RequiresMountsFor=/srv/assistant-agent" in mount_unit
+    mount_command = next(line for line in mount_unit.splitlines() if line.startswith("ExecStart="))
+    # FUSE 2 suppresses its automatic subtype when fsname is supplied explicitly.
+    assert "-o fsname=@BUCKET@:/user-data" in mount_command
+    assert "-o subtype=s3fs" in mount_command
     assert mount_unit.index(" cleanup") < mount_unit.index(" prepare") < mount_unit.index("ExecStart=")
     for directive in ("Requires", "After", "BindsTo"):
         matching = [line for line in app_unit.splitlines() if line.startswith(directive + "=")]
