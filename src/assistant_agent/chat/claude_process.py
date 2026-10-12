@@ -89,7 +89,16 @@ class ClaudeProcess:
         self = cls(sandbox_service, sandbox_handle)
         self.before_close = before_close
         self.path = f"/tmp/assistant-chat-{token}.pid"
-        launch_argv = cls.argv + ["--allowedTools", *LOCAL_APPROVALS]
+        launch_argv = list(cls.argv)
+        approvals = list(LOCAL_APPROVALS)
+        if sandbox_handle.host_daily_logs_path is not None:
+            if "--tools" in launch_argv:
+                launch_argv[launch_argv.index("--tools") + 1] = "Read,Glob,Grep,Bash,Edit,Write"
+            else:
+                launch_argv += ["--tools", "Read,Glob,Grep,Bash,Edit,Write"]
+            launch_argv += ["--add-dir", "/daily-logs"]
+            approvals += ["Read(//daily-logs/**)", "Edit(//daily-logs/**)"]
+        launch_argv += ["--allowedTools", *approvals]
         if gmail_enabled:
             if not mcp_token:
                 raise ValueError("Gmail launch requires an access grant")

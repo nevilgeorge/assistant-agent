@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
 from collections.abc import Awaitable
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from assistant_agent import sandbox
+from assistant_agent.daily_logs import DailyLogService
+from assistant_agent.user_timezone import UserTimezoneService
 
 from . import constants
 from .chat_error import ChatError
@@ -37,6 +41,8 @@ class ConversationManager:
         self, process_factory=ClaudeProcess, service: sandbox.Sandbox | None = None,
         access_service: SandboxAccessService | None = None,
         session_files_service: SessionFilesService | None = None,
+        *, daily_log_service: DailyLogService | None = None,
+        user_timezone_service: UserTimezoneService | None = None,
     ) -> None:
         """Initialize conversation limits, task tracking, and sandbox ownership."""
         self.process_factory = process_factory
@@ -44,6 +50,12 @@ class ConversationManager:
         self.owns_sandbox_service = service is None
         self.access_service = access_service
         self.session_files_service = session_files_service
+        self.daily_log_service = (
+            daily_log_service if daily_log_service is not None
+            else DailyLogService(self.sandbox_service.settings)
+        )
+        self.owns_daily_log_service = daily_log_service is None
+        self.user_timezone_service = user_timezone_service
         self.needs_access_invalidation = access_service is not None
         self.conversations = {}
         self.blocked_users: set[str] = set()
@@ -193,23 +205,47 @@ class ConversationManager:
         if conversation.transcript_size_bytes + len(prompt.encode()) > constants.PROTOCOL_LIMIT:
             raise ChatError("Conversation limit reached. Start a new conversation.")
         process = conversation.claude_process
+        existing_process = process is not None
         if process:
+            timezone_name = conversation.daily_log.timezone_name
+            timestamp = self.daily_log_service.current_user_time(timezone_name)
+            augmented_prompt = self._context_prompt(prompt, timestamp)
             result = self._begin_turn(conversation, prompt)
         else:
             conversation.is_starting = True
-            process, result = await self._spawn(conversation, prompt)
+            process, result, augmented_prompt = await self._spawn(conversation, prompt)
         try:
             async with asyncio.timeout(sandbox.REQUEST_TIMEOUT_SECONDS):
-                await process.send(prompt)
+                if existing_process:
+                    try:
+                        conversation.daily_log = await self.daily_log_service.ensure_today(
+                            user, timezone_name, timestamp,
+                        )
+                    except Exception:
+                        logger.warning("Daily-log rollover preparation failed")
+                if (conversation.is_retired or conversation.has_failed
+                        or conversation.active_turn_id != result["turn_id"] or self.stopped):
+                    return result
+                await process.send(augmented_prompt)
         except Exception:
             conversation.fail("The assistant conversation ended. Start a new conversation.")
         return result
 
-    async def _spawn(self, conversation: Conversation, prompt: str) -> tuple[ClaudeProcess, dict]:
+    @staticmethod
+    def _context_prompt(prompt: str, timestamp: datetime) -> str:
+        """Attach captured user-local time and enforce the complete stdin message limit."""
+        augmented_prompt = f"Current user time: {timestamp.isoformat()}\n\n{prompt}"
+        message = {"type": "user", "message": {"role": "user", "content": augmented_prompt}}
+        if len((json.dumps(message) + "\n").encode()) > constants.PROTOCOL_LIMIT:
+            raise ChatError("Message limit reached. Send a shorter message.", 413)
+        return augmented_prompt
+
+    async def _spawn(self, conversation: Conversation, prompt: str) -> tuple[ClaudeProcess, dict, str]:
         """Start a reserved conversation process and close it if already retired."""
         process = None
         begun = False
         startup_failure = None
+        invalid_message = False
         try:
             try:
                 async with self.cleanup_lock:
@@ -217,9 +253,39 @@ class ConversationManager:
                     if self.needs_cleanup:
                         await cleanup_orphans(self.sandbox_service)
                         self.needs_cleanup = False
-                conversation.sandbox_handle = await self.sandbox_service.allocate(
-                    conversation.user_id, conversation.conversation_id
+                timezone_name = (
+                    await self.user_timezone_service.resolve(conversation.user_id)
+                    if self.user_timezone_service is not None else "UTC"
                 )
+                timestamp = self.daily_log_service.current_user_time(timezone_name)
+                try:
+                    augmented_prompt = self._context_prompt(prompt, timestamp)
+                except ChatError:
+                    invalid_message = True
+                    raise
+                conversation.daily_log = await self.daily_log_service.prepare(
+                    conversation.user_id, timezone_name, timestamp,
+                )
+                if conversation.is_retired or self.stopped:
+                    raise ChatError("The assistant conversation ended. Start a new conversation.", 503)
+                allocation_task = self._track(self.sandbox_service.allocate(
+                    conversation.user_id, conversation.conversation_id,
+                    host_daily_logs_path=conversation.daily_log.host_daily_logs_path,
+                ))
+                try:
+                    conversation.sandbox_handle = await asyncio.shield(allocation_task)
+                except asyncio.CancelledError:
+                    # Docker allocation is shielded; wait for its handle so cleanup can remove it.
+                    while not allocation_task.done():
+                        try:
+                            await asyncio.shield(allocation_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not allocation_task.cancelled() and allocation_task.exception() is None:
+                        conversation.sandbox_handle = allocation_task.result()
+                    raise
                 if conversation.is_retired or self.stopped:
                     raise ChatError("The assistant conversation ended. Start a new conversation.", 503)
                 raw_token = None
@@ -307,6 +373,8 @@ class ConversationManager:
                         raw_token = None
                     selected = True
             except Exception:
+                if invalid_message:
+                    raise
                 if startup_failure:
                     conversation.fail(startup_failure)
                     raise ChatError(
@@ -321,10 +389,12 @@ class ConversationManager:
                 raise ChatError("The assistant conversation ended. Start a new conversation.", 503)
             result = self._begin_turn(conversation, prompt)
             begun = True
-            return process, result
+            return process, result, augmented_prompt
         finally:
             conversation.is_starting = False
-            if not begun:
+            if not begun and (not invalid_message or conversation.is_retired or self.stopped):
+                # A cancelled startup requires a fresh conversation before retrying.
+                conversation.has_failed = True
                 conversation.claude_process = process
                 conversation.request_close()
                 if conversation.cleanup_task:
@@ -395,5 +465,9 @@ class ConversationManager:
                 if isinstance(result, BaseException):
                     raise result
         finally:
-            if self.owns_sandbox_service:
-                await self.sandbox_service.close()
+            try:
+                if self.owns_sandbox_service:
+                    await self.sandbox_service.close()
+            finally:
+                if self.owns_daily_log_service:
+                    await self.daily_log_service.aclose()

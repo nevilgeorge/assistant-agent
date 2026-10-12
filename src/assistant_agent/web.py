@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from collections.abc import AsyncIterator
 import hmac
 import json
@@ -27,9 +27,10 @@ from assistant_agent.sandbox_access import SandboxAccessService
 from assistant_agent.async_workers import AsyncWorker
 from assistant_agent.database import make_async_engine, make_async_session_factory
 from assistant_agent.chat import ChatError, Conversation, ConversationManager
+from assistant_agent.daily_logs import DailyLogService
 from assistant_agent.config import ConfigError, SCOPES, Settings, TEMPLATES_DIR, get_settings
 from assistant_agent.google_oauth import account_identity, authorization_url, exchange_code, revoke
-from assistant_agent.user_timezone import fetch_primary_calendar_timezone
+from assistant_agent.user_timezone import UserTimezoneService, fetch_primary_calendar_timezone
 from assistant_agent.web_store import WebStore
 from assistant_agent.gmail_service import GmailService
 from assistant_agent.gmail_mcp import GmailMCP
@@ -56,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     conversation_manager = None
     gmail_service = None
     session_files_service = None
+    daily_log_service = None
     account_cleanup_tasks: set[asyncio.Task[None]] = set()
     app.state.account_cleanup_tasks = account_cleanup_tasks
     sandbox_service = Sandbox()
@@ -70,9 +72,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         gmail_service = GmailService(web_store)
         session_files_service = SessionFilesService(gmail_service)
         sandbox_access_service = SandboxAccessService(session_factory)
+        daily_log_service = DailyLogService(sandbox_service.settings)
+        user_timezone_service = UserTimezoneService(web_store, google_worker)
         conversation_manager = ConversationManager(
             service=sandbox_service, access_service=sandbox_access_service,
             session_files_service=session_files_service,
+            daily_log_service=daily_log_service, user_timezone_service=user_timezone_service,
         )
         app.state.settings = settings
         app.state.google_worker = google_worker
@@ -82,6 +87,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.sandbox_service = sandbox_service
         app.state.sandbox_access_service = sandbox_access_service
         app.state.conversation_manager = conversation_manager
+        app.state.daily_log_service = daily_log_service
+        app.state.user_timezone_service = user_timezone_service
         await conversation_manager.start()
         gmail_mcp = GmailMCP(
             gmail_service=gmail_service,
@@ -102,24 +109,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # Cleanup also runs if startup fails or the lifespan is cancelled.
         with CancelScope(shield=True):
-            try:
+            async with AsyncExitStack() as cleanup_stack:
+                # Callbacks run in reverse order, even if an earlier cleanup fails.
+                cleanup_stack.push_async_callback(engine.dispose)
+                if gmail_service is not None:
+                    cleanup_stack.push_async_callback(gmail_service.aclose)
+                if session_files_service is not None:
+                    cleanup_stack.push_async_callback(session_files_service.aclose)
+                if daily_log_service is not None:
+                    cleanup_stack.push_async_callback(daily_log_service.aclose)
+                cleanup_stack.push_async_callback(sandbox_service.close)
                 if account_cleanup_tasks:
                     await asyncio.gather(*list(account_cleanup_tasks), return_exceptions=True)
                 if conversation_manager is not None:
                     await conversation_manager.close()
-            finally:
-                try:
-                    await sandbox_service.close()
-                finally:
-                    try:
-                        try:
-                            if session_files_service is not None:
-                                await session_files_service.aclose()
-                        finally:
-                            if gmail_service is not None:
-                                await gmail_service.aclose()
-                    finally:
-                        await engine.dispose()
 
 
 def create_app() -> FastAPI:

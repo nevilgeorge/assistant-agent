@@ -26,10 +26,11 @@ async def web(tmp_path, monkeypatch):
     monkeypatch.setenv("BASE_URL", "http://localhost:8000")
     monkeypatch.setenv("APP_ENV", "development")
     from assistant_agent import config, web as module
-    from test_chat import FakeProcess, FakeSandbox
+    from test_chat import FakeDailyLogService, FakeProcess, FakeSandbox
 
     config.get_settings.cache_clear()
     monkeypatch.setattr(module, "Sandbox", FakeSandbox)
+    monkeypatch.setattr(module, "DailyLogService", FakeDailyLogService)
     monkeypatch.setattr(module, "fetch_primary_calendar_timezone", lambda creds: None)
     # Production applies migrations before lifespan startup and grant invalidation.
     setup_engine = module.make_async_engine(config.get_settings().database_url)
@@ -928,3 +929,43 @@ async def test_oauth_timezone_failure_preserves_value_and_authenticates(web, mon
     client = await connect(web, monkeypatch, "timezone-sub", "user@example.com")
     assert (await web.web_store.user(user_id)).timezone == "Asia/Tokyo"
     assert (await web.web_store.session(client.cookies.get(web.COOKIE))).user_id == user_id
+
+
+async def test_lifespan_injects_daily_logs_and_timezone_services(web):
+    state = web.app.state
+    assert state.conversation_manager.daily_log_service is state.daily_log_service
+    assert state.conversation_manager.user_timezone_service is state.user_timezone_service
+    assert not state.conversation_manager.owns_daily_log_service
+    assert state.user_timezone_service.web_store is state.web_store
+    assert state.user_timezone_service.google_worker is state.google_worker
+
+
+async def test_daily_log_shutdown_timeout_still_closes_other_resources(web, monkeypatch):
+    dispose = AsyncMock()
+    monkeypatch.setattr(web.module, "make_async_engine", lambda url: SimpleNamespace(dispose=dispose))
+    monkeypatch.setattr(web.module, "make_async_session_factory", lambda engine: web.web_store.factory)
+    application = web.module.create_app()
+    with pytest.raises(TimeoutError, match="worker remains running"):
+        async with application.router.lifespan_context(application):
+            application.state.daily_log_service.aclose.side_effect = TimeoutError("worker remains running")
+    application.state.daily_log_service.aclose.assert_awaited_once()
+    application.state.sandbox_service.close.assert_awaited_once()
+    assert application.state.session_files_service._closed
+    assert application.state.gmail_service._closed
+    dispose.assert_awaited_once()
+
+
+async def test_lifespan_drains_containers_before_daily_log_workers(web, monkeypatch):
+    from test_chat import FakeDailyLogService, FakeSandbox
+
+    ordering = []
+    sandbox_service = FakeSandbox()
+    daily_log_service = FakeDailyLogService()
+    sandbox_service.close.side_effect = lambda: ordering.append("sandbox")
+    daily_log_service.aclose.side_effect = lambda: ordering.append("daily_logs")
+    monkeypatch.setattr(web.module, "Sandbox", lambda: sandbox_service)
+    monkeypatch.setattr(web.module, "DailyLogService", lambda settings: daily_log_service)
+    application = web.module.create_app()
+    async with application.router.lifespan_context(application):
+        application.state.conversation_manager.close = AsyncMock(side_effect=lambda: ordering.append("conversations"))
+    assert ordering == ["conversations", "sandbox", "daily_logs"]

@@ -267,7 +267,8 @@ async def audit_harness(harness: Any) -> dict[str, Any]:
         assert by_name["mcp_without_bearer"].get("http_status") == 401
         container = await harness.docker.containers.get(handle.container_id)
         mounts = container["HostConfig"].get("Binds", [])
-        assert mounts == [f"{handle.host_input_path}:/input:ro"]
+        assert mounts == [f"{handle.host_input_path}:/input:ro",
+                          f"{handle.host_daily_logs_path}:/daily-logs"]
         environment_names = [entry.split("=", 1)[0] for entry in container["Config"].get("Env", [])]
         assert not any(name.startswith("GOOGLE") or name in {
             "DATABASE_URL", "CREDENTIAL_ENCRYPTION_KEY", "ASSISTANT_MCP_TOKEN",

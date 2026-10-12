@@ -54,18 +54,21 @@ class ControlStream:
         self.closed = True
 
 
-def handle():
-    return sandbox.SandboxHandle("container", "user", "abc", Path("/tmp"), Path("/tmp"))
+def handle(*, daily_logs=False):
+    return sandbox.SandboxHandle(
+        "container", "user", "abc", Path("/tmp"), Path("/tmp"),
+        host_daily_logs_path=Path("/host/user/daily-logs") if daily_logs else None,
+    )
 
 
-async def launch(stream, *, gmail=True):
+async def launch(stream, *, gmail=True, daily_logs=False):
     service = SimpleNamespace(
         exec=AsyncMock(return_value=SimpleNamespace(start=lambda: stream)),
         run=AsyncMock(return_value=sandbox.ExecResult(0, "")),
     )
     received, failed = [], []
     process = await claude_process.ClaudeProcess.create(
-        "conversation", received.append, failed.append, service, handle(),
+        "conversation", received.append, failed.append, service, handle(daily_logs=daily_logs),
         gmail_enabled=gmail, mcp_token="synthetic-grant" if gmail else None,
     )
     return process, service, received, failed
@@ -105,6 +108,42 @@ async def test_chat_only_has_no_token_and_denies_mcp():
     assert "--append-system-prompt " not in command
     assert not any(name in command for name in claude_process.GMAIL_TOOLS)
     await process.close()
+
+
+@pytest.mark.parametrize("gmail", [False, True])
+@pytest.mark.parametrize("daily_logs", [False, True])
+async def test_daily_log_permissions_depend_on_mount(gmail, daily_logs):
+    process, service, _, _ = await launch(ControlStream(), gmail=gmail, daily_logs=daily_logs)
+    try:
+        arguments = shlex.split(shlex.split(service.exec.call_args.args[0])[-1].split("exec ", 1)[1])
+        assert arguments[arguments.index("--tools") + 1] == (
+            "Read,Glob,Grep,Bash,Edit,Write" if daily_logs else "Read,Glob,Grep,Bash"
+        )
+        assert "/input" in arguments
+        assert ("/daily-logs" in arguments) is daily_logs
+        assert ("Read(//daily-logs/**)" in arguments) is daily_logs
+        assert ("Edit(//daily-logs/**)" in arguments) is daily_logs
+        assert "Read(//input/**)" in arguments
+        assert "Write(//daily-logs/**)" not in arguments
+        assert ("--disallowedTools" in arguments) is not gmail
+        assert all((tool in arguments) is gmail for tool in claude_process.GMAIL_TOOLS)
+        assert arguments[arguments.index("--append-system-prompt-file") + 1] == "/workspace/CLAUDE.md"
+    finally:
+        await process.close()
+
+
+async def test_daily_log_launch_does_not_leak_arguments_into_next_process():
+    original_arguments = list(claude_process.ClaudeProcess.argv)
+    original_approvals = list(claude_process.LOCAL_APPROVALS)
+    for daily_logs, gmail in [(True, True), (False, False), (True, False), (False, True)]:
+        process, service, _, _ = await launch(ControlStream(), gmail=gmail, daily_logs=daily_logs)
+        try:
+            command = shlex.split(service.exec.call_args.args[0])[-1]
+            assert ("/daily-logs" in command) is daily_logs
+            assert claude_process.ClaudeProcess.argv == original_arguments
+            assert claude_process.LOCAL_APPROVALS == original_approvals
+        finally:
+            await process.close()
 
 
 @pytest.mark.parametrize("bare_names", [False, True])

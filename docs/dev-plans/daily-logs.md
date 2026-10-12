@@ -1,6 +1,6 @@
 # Daily agent log files on an S3-backed FUSE mount
 
-Status: Draft plan, not approved or implemented. Last updated: 2026-10-12
+Status: Phases 1–6 implemented; Phases 7–8 pending. Last updated: 2026-10-12
 
 ## Context
 
@@ -157,17 +157,19 @@ Deployment and operations:
   Also exercise failed uploads and process termination during writes; recovery is an
   application/host concern, not an agent instruction.
 
-Two application concerns remain separate from mount options: prevent overlapping writers for
-one user during reset/deployment, and bound/track filesystem workers because timing out an
-`asyncio.to_thread` await does not terminate a stalled FUSE call. Their precise implementation
-remains to be resolved.
+Filesystem workers are bounded and tracked separately from mount options because timing out an
+`asyncio.to_thread` await does not terminate a stalled FUSE call. Phase 3 retains worker admission
+until I/O finishes and provides a bounded, resumable shutdown drain. For now, assume that reset or
+retirement will not overlap a replacement daily-log writer; no per-user conversation ownership
+guard is implemented. Cross-instance coordination remains out of scope.
 
 ### App flow
 
-1. `ConversationManager._spawn` resolves the user's timezone, then calls
-   `DailyLogService.prepare(user_id, timezone)`, which creates the logs folder and today's file.
+1. `ConversationManager._spawn` resolves the user's timezone, captures the turn timestamp,
+   and calls `DailyLogService.prepare(user_id, timezone, timestamp)`,
+   which creates the logs folder and today's file using that captured local date.
 2. It passes the resulting host path to `Sandbox.allocate(..., host_daily_logs_path=...)`. Preparation
-   stays out of `Sandbox._allocate`, which holds the global lock (`sandbox.py:188`).
+   stays out of `Sandbox._create_and_provision_sandbox`, which holds the global lock.
 3. `_container_config` adds `f"{handle.host_daily_logs_path}:/daily-logs"` when the handle has a logs path.
 4. `ClaudeProcess.create` enables `Edit`/`Write` scoped to `/daily-logs` and adds log guidance.
 5. **Midnight rollover:** in `_submit`, for an existing process, call `_begin_turn` first and then
@@ -195,6 +197,8 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
 
 ### Phase 1 — Settings
 
+Status: Implemented
+
 - `src/assistant_agent/config.py`: add `host_user_data_root` / `app_user_data_root` to
   `SandboxSettings` (default `DATA_DIR / "user-data"`), read from `SANDBOX_HOST_USER_DATA_ROOT` /
   `SANDBOX_APP_USER_DATA_ROOT`, with the existing absolute/non-root/no-`..` validation.
@@ -203,6 +207,8 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
 - `tests/test_sandbox_lifecycle.py`: extend `test_settings_validation`.
 
 ### Phase 2 — User timezone
+
+Status: Implemented
 
 - `src/assistant_agent/database.py`: nullable `User.timezone` (`String(64)`).
 - New Alembic revision adding the column.
@@ -221,6 +227,8 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
   (`tests/test_web_auth.py`).
 
 ### Phase 3 — Implement DailyLogs module (`src/assistant_agent/daily_logs.py`)
+
+Status: Implemented
 
 - `DailyLog` dataclass: `host_daily_logs_path`, `app_daily_logs_path`, `local_date`, `timezone_name`.
 - Provide an injectable clock for capturing an aware user-local timestamp. Derive the local
@@ -249,9 +257,12 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
 
 ### Phase 4 — Sandbox bind
 
+Status: Implemented
+
 - `src/assistant_agent/sandbox.py`:
   - `SandboxHandle.host_daily_logs_path: Path | None = None`.
-  - `allocate`, `_allocate_with_timeout`, `_allocate` take keyword-only `host_daily_logs_path`, verify
+  - `allocate`, `_allocate_with_timeout`, `_create_and_provision_sandbox` take keyword-only
+    `host_daily_logs_path`, verify
     it is under `settings.host_user_data_root`, and carry it through both handle constructions
     (`:201`, `:215`).
   - `_container_config` appends the `/daily-logs` bind when set.
@@ -261,6 +272,8 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
   destroy/reconcile leave a logs tree alone.
 
 ### Phase 5 — Agent permissions and prompt
+
+Status: Implemented
 
 - `src/assistant_agent/chat/claude_process.py`: build `--tools`, `--add-dir` and approvals in
   `create` from `sandbox_handle.host_daily_logs_path`; retain the existing prompt-file loading.
@@ -277,6 +290,8 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
 
 ### Phase 6 — Conversation wiring and per-request user time
 
+Status: Implemented
+
 - `src/assistant_agent/chat/conversation.py`: `daily_log: DailyLog | None`.
 - `src/assistant_agent/chat/conversation_manager.py`: `daily_log_service` and
   `user_timezone_service` constructor parameters. Resolve the timezone at spawn; capture one
@@ -288,14 +303,14 @@ Each phase keeps `uv run pytest -q` and `uv run ruff check .` green.
   UTC offset>` on every request. Do not additionally send a timezone name or daily-log path.
   Retain the original user prompt in the visible transcript; the augmented content is only
   sent to Claude. Test the extra content against protocol-size limits.
-- Implement same-user writer lifecycle handling so reset or retirement does
-  not launch a replacement writer before the previous writer has stopped.
+- Assume reset or retirement does not overlap a replacement daily-log writer for now;
+  defer same-user conversation ownership handling.
 - `src/assistant_agent/web.py` lifespan: construct both services, pass them in, and close/drain
   daily-log worker resources during shutdown using the lifecycle handling from Phase 3.
 - Tests: `FakeSandbox.allocate` gains `host_daily_logs_path=None` (`tests/test_chat.py:26`); fake
   daily-log service and clock; tests for spawn failure, rollover call/failure, no double turn,
   first and later request timestamps, non-UTC offsets, midnight consistency, unchanged visible
-  transcripts, and reset/submit overlap.
+  transcripts, and cancellation cleanup.
   `tests/gmail_phase6_checks.py:270` expects two binds (it runs the real lifespan).
 
 ### Phase 7 — Terraform, systemd, and deployment

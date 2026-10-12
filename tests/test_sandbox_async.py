@@ -1,9 +1,15 @@
 """Public aiodocker API contracts and opt-in Compose sandbox checks."""
 
 import asyncio
+import io
 import os
 import shlex
+import tarfile
+import tempfile
 import uuid
+from datetime import UTC, datetime
+from importlib import resources
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +18,8 @@ import aiodocker
 from aiodocker.stream import Message
 
 from assistant_agent import chat, sandbox
+from assistant_agent.config import SandboxSettings, get_sandbox_settings
+from assistant_agent.daily_logs import DailyLogService
 from test_chat import FakeStream
 
 
@@ -130,23 +138,25 @@ for line in sys.stdin:
     monkeypatch.setattr(chat.ClaudeProcess, "argv", ["python3", "-u", "-c", program])
     async with sandbox.Sandbox() as service:
         manager = chat.ConversationManager(service=service)
+        user_id = uuid.uuid4().hex
         try:
-            await manager.submit("test", "first")
-            conversation = manager.get("test")
+            await manager.submit(user_id, "first")
+            conversation = manager.get(user_id)
             process = conversation.claude_process
             async with asyncio.timeout(5):
                 while conversation.active_turn_id:
                     await asyncio.sleep(0.01)
-            await manager.submit("test", "雪 second")
+            await manager.submit(user_id, "雪 second")
             async with asyncio.timeout(5):
                 while conversation.active_turn_id:
                     await asyncio.sleep(0.01)
             assert not conversation.has_failed and conversation.claude_process is process
-            assert conversation.transcript_messages[-1]["text"] == "雪 second"
+            assert conversation.transcript_messages[-1]["text"].startswith("Current user time: ")
+            assert conversation.transcript_messages[-1]["text"].endswith("\n\n雪 second")
             handle = conversation.sandbox_handle
             child = (await service.run(f"cat {shlex.quote(child_path)}", name=handle.container_id)).output.strip()
             assert child.isdigit()
-            await manager.reset("test")
+            await manager.reset(user_id)
             assert process.output_reader_task.done() and process.is_closed
             with pytest.raises(aiodocker.DockerError) as missing:
                 await service._client(sandbox.DockerClientRole.CONTROL).containers.get(handle.container_id)
@@ -171,12 +181,29 @@ async def test_failed_stream_open_releases_partial_attachment():
         assert stream.closed == 1
 
 
+async def test_context_archive_contains_packaged_daily_log_guidance():
+    """Check the actual provisioned archive, including its daily-log instructions."""
+    container = SimpleNamespace(put_archive=AsyncMock())
+    service = sandbox.Sandbox()
+    await service._provision_context_files(container)
+    destination, archive_bytes = container.put_archive.call_args.args
+    assert destination == "/workspace"
+    expected_context = resources.files("assistant_agent.agent_kit").joinpath("CLAUDE.md").read_bytes()
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes)) as archive:
+        context_file = archive.getmember("CLAUDE.md")
+        assert context_file.uid == context_file.gid == 0 and context_file.mode == 0o644
+        context = archive.extractfile(context_file).read()
+        assert context == expected_context
+    assert b"# Daily logs" in context
+    assert b"/daily-logs/YYYY-MM-DD.md" in context
+    assert b"latest supplied" in context
+    assert b"Never create, rename, or delete daily-log" in context
+
+
 @pytestmark_docker
 async def test_docker_input_publication_workspace_environment_and_inspection():
     async with sandbox.Sandbox() as service:
         handle = await service.allocate("input-test", uuid.uuid4().hex)
-        from importlib import resources
-
         context = await service.run("cat /workspace/CLAUDE.md", name=handle.container_id)
         assert context.ok
         assert context.output.encode() == resources.files("assistant_agent.agent_kit").joinpath(
@@ -234,3 +261,126 @@ async def test_exec_environment_uses_docker_argument_without_shell_interpolation
     assert container.exec.call_args.args == (["bash", "-lc", "claude --version"],)
     assert container.exec.call_args.kwargs["environment"] is private
     assert private["ANTHROPIC_API_KEY"] not in caplog.text
+
+
+@pytest.mark.skipif(
+    os.getenv("CLAUDE_DAILY_LOGS_INTEGRATION") != "1",
+    reason="Set CLAUDE_DAILY_LOGS_INTEGRATION=1 for real Docker/model daily-log checks",
+)
+@pytest.mark.parametrize("gmail_enabled", [False, True], ids=["chat-only", "gmail-launch"])
+async def test_installed_claude_daily_log_permissions(gmail_enabled: bool) -> None:
+    """Exercise installed CLI reads, edits, and denied writes with synthetic files."""
+    assert os.getenv("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY is required"
+    run_id = uuid.uuid4().hex
+    docker_client = aiodocker.Docker()
+    network = None
+    service = None
+    daily_log_service = None
+    process = None
+    with tempfile.TemporaryDirectory(prefix="claude-daily-logs-", dir="/private/tmp") as directory:
+        root = Path(directory)
+        try:
+            image = await docker_client.images.inspect(get_sandbox_settings().image)
+            network_name = f"daily-logs-{run_id}"
+            network = await docker_client.networks.create({"Name": network_name})
+            settings = SandboxSettings(
+                image=image["Id"], network=network_name, deployment_id=f"test-{run_id}",
+                host_input_root=root / "inputs", app_input_root=root / "inputs",
+                host_user_data_root=root / "user-data", app_user_data_root=root / "user-data",
+            )
+            service = sandbox.Sandbox(settings)
+            daily_log_service = DailyLogService(settings)
+            timestamp = datetime(2026, 10, 12, 14, 35, tzinfo=UTC)
+            daily_log = await daily_log_service.prepare(run_id, "UTC", timestamp)
+            dated_file = daily_log.app_daily_logs_path / "2026-10-12.md"
+            marker = f"PRIVATE_DAILY_ENTRY_{uuid.uuid4().hex}"
+            original_content = dated_file.read_text() + f"\n{marker}\n"
+            dated_file.write_text(original_content)
+            handle = await service.allocate(
+                run_id, run_id, host_daily_logs_path=daily_log.host_daily_logs_path,
+            )
+            context = await service.run("cat /workspace/CLAUDE.md", name=handle.container_id)
+            assert context.ok
+            assert context.output.encode() == resources.files("assistant_agent.agent_kit").joinpath(
+                "CLAUDE.md"
+            ).read_bytes()
+            input_file = handle.app_input_path / "outside.md"
+            input_file.write_text("input original\n")
+            input_file.chmod(0o644)
+            assert (await service.run(
+                "printf 'workspace original\\n' > /workspace/outside.md",
+                name=handle.container_id,
+            )).ok
+            # Server discovery is covered separately; preserve Gmail launch flags
+            # while keeping this synthetic filesystem check independent of a server.
+            await service.provision_mcp(handle, gmail_enabled=False)
+            events: list[dict] = []
+            failures: list[str] = []
+            process = await chat.ClaudeProcess.create(
+                run_id, events.append, failures.append, service, handle,
+                gmail_enabled=gmail_enabled,
+                mcp_token="synthetic-unused" if gmail_enabled else None,
+            )
+
+            async def complete_turn(prompt: str) -> dict:
+                """Send a prompt and await one model result without exposing file contents."""
+                events.clear()
+                await process.send(f"Current user time: {timestamp.isoformat()}\n\n{prompt}")
+                async with asyncio.timeout(180):
+                    while not any(event.get("type") == "result" for event in events):
+                        assert not failures, "Claude transport failed"
+                        await asyncio.sleep(0.1)
+                result = next(event for event in events if event.get("type") == "result")
+                assert not result.get("is_error"), "Model turn failed"
+                return result
+
+            appended_entry = f"Verified daily entry {uuid.uuid4().hex}"
+            result = await complete_turn(
+                "Read today's daily log with the Read tool. Report the private entry you find, "
+                f"and use Edit to append exactly this entry while preserving all existing text: "
+                f"{appended_entry}."
+            )
+            assert marker in result.get("result", ""), "Daily-log read did not return the entry"
+            updated_content = dated_file.read_text()
+            assert original_content in updated_content and appended_entry in updated_content
+            tools = {
+                block.get("name") for event in events if event.get("type") == "assistant"
+                for block in event.get("message", {}).get("content", [])
+                if block.get("type") == "tool_use"
+            }
+            assert {"Read", "Edit"}.issubset(tools)
+            denied = await complete_turn(
+                "Test the tool permission boundary. Attempt Write on /workspace/forbidden.md "
+                "with content forbidden, and attempt Edit on /input/outside.md replacing "
+                "'input original' with 'input changed'. Use those tools directly, not Bash. "
+                "Report any permission refusals."
+            )
+            assert denied.get("permission_denials"), "Expected CLI permission denials"
+            assert input_file.read_text() == "input original\n"
+            assert (await service.run(
+                "test ! -e /workspace/forbidden.md && "
+                "test \"$(cat /workspace/outside.md)\" = 'workspace original'",
+                name=handle.container_id,
+            )).ok
+            await process.close()
+            process = None
+            await service.destroy(handle)
+            assert dated_file.read_text() == updated_content
+        finally:
+            try:
+                if process is not None:
+                    await process.close()
+            finally:
+                try:
+                    if service is not None:
+                        await service.close()
+                finally:
+                    try:
+                        if daily_log_service is not None:
+                            await daily_log_service.aclose()
+                    finally:
+                        try:
+                            if network is not None:
+                                await network.delete()
+                        finally:
+                            await docker_client.close()

@@ -15,6 +15,7 @@ from aiodocker.stream import Message
 from assistant_agent import chat, sandbox
 from assistant_agent.chat import ChatError, ConversationManager, constants
 from assistant_agent.chat import debug_logging
+from assistant_agent.daily_logs import DailyLog
 
 
 class FakeSandbox:
@@ -25,18 +26,46 @@ class FakeSandbox:
         self.retry_cleanup = AsyncMock()
         self.close = AsyncMock()
         self.provision_mcp = AsyncMock()
+        self.settings = SimpleNamespace(
+            host_user_data_root=Path("/host/user-data"),
+            app_user_data_root=Path("/app/user-data"),
+        )
 
-    async def allocate(self, user_id, conversation_id):
+    async def allocate(self, user_id, conversation_id, *, host_daily_logs_path=None):
         handle = sandbox.SandboxHandle(
             f"container-{conversation_id}", user_id, conversation_id,
             Path("/host/session-inputs") / conversation_id,
             Path("/app/session-inputs") / conversation_id,
+            host_daily_logs_path,
         )
         self.allocated.append(handle)
         return handle
 
     async def destroy(self, handle):
         self.destroyed.append(handle)
+
+
+class FakeDailyLogService:
+    """Capture deterministic timestamps without filesystem access in chat tests."""
+
+    def __init__(self, settings=None):
+        self.timestamp = datetime(2026, 10, 12, 14, 35, tzinfo=UTC)
+        self.prepare = AsyncMock(side_effect=self._daily_log)
+        self.ensure_today = AsyncMock(side_effect=self._daily_log)
+        self.aclose = AsyncMock()
+
+    def current_user_time(self, timezone_name):
+        from zoneinfo import ZoneInfo
+        return self.timestamp.astimezone(ZoneInfo(timezone_name))
+
+    def _daily_log(self, user_id, timezone_name, timestamp):
+        return DailyLog(Path("/host/user-data") / user_id / "daily-logs",
+                        Path("/app/user-data") / user_id / "daily-logs",
+                        timestamp.date(), timezone_name)
+
+
+def contextual_prompt(prompt):
+    return f"Current user time: 2026-10-12T14:35:00+00:00\n\n{prompt}"
 
 
 def fake_handle():
@@ -85,7 +114,8 @@ class FakeProcess:
 
 @pytest.fixture
 async def manager():
-    manager = ConversationManager(FakeProcess, service=FakeSandbox())
+    manager = ConversationManager(FakeProcess, service=FakeSandbox(),
+                                  daily_log_service=FakeDailyLogService())
     yield manager
     await manager.close()
 
@@ -107,7 +137,7 @@ async def test_multiple_turns_stream_without_restarting_process(manager):
     process.finish()
     second = await manager.submit("alice", "What color?")
     assert conversation.claude_process is process and first["turn_id"] != second["turn_id"]
-    assert process.prompts == ["Remember blue", "What color?"]
+    assert process.prompts == [contextual_prompt("Remember blue"), contextual_prompt("What color?")]
     process.text("Blue again")
     process.finish()
     assert [e["type"] for e in conversation.replay_events].count("turn_completion") == 2
@@ -197,7 +227,7 @@ async def test_spawn_does_not_block_other_callers(manager):
     gate.release.set()
     outcome = await task
     assert outcome["turn_id"] == conversation.active_turn_id
-    assert conversation.claude_process.prompts == ["one"] and not conversation.is_starting
+    assert conversation.claude_process.prompts == [contextual_prompt("one")] and not conversation.is_starting
 
 
 @pytest.mark.parametrize("shutdown", [False, True], ids=["reset", "shutdown"])
@@ -233,7 +263,7 @@ async def test_request_cancellation_preserves_reserved_submission(manager):
     gate.release.set()
     await asyncio.gather(*manager.background_tasks)
     conversation = manager.get("alice")
-    assert conversation.claude_process.prompts == ["one"] and not conversation.is_starting
+    assert conversation.claude_process.prompts == [contextual_prompt("one")] and not conversation.is_starting
     assert not manager.background_tasks
 
 
@@ -279,7 +309,7 @@ async def test_spawn_failure_releases_reservation(manager, error):
         await manager.submit("alice", "one")
     conversation = manager.get("alice")
     assert not conversation.is_starting and not conversation.replay_events
-    assert conversation.has_failed is (error is RuntimeError)
+    assert conversation.has_failed
 
 
 async def test_cleanup_runs_once_before_any_spawn(manager, monkeypatch):
@@ -452,15 +482,15 @@ async def test_real_claude_multiple_turns(
     manager = ConversationManager()
     try:
         await manager.start()
-        await manager.submit("integration", "Remember the codeword cobalt. Reply with only OK.")
-        conversation = manager.get("integration")
+        await manager.submit("a" * 32, "Remember the codeword cobalt. Reply with only OK.")
+        conversation = manager.get("a" * 32)
         async with asyncio.timeout(125):
             while conversation.active_turn_id:
                 await asyncio.sleep(0.1)
         assert not conversation.has_failed
         process = conversation.claude_process
         await manager.submit(
-            "integration", "What codeword did I give you? Reply with only that word."
+            "a" * 32, "What codeword did I give you? Reply with only that word."
         )
         async with asyncio.timeout(125):
             while conversation.active_turn_id:
@@ -480,7 +510,7 @@ async def test_real_claude_multiple_turns(
         assert any("cobalt" in block.get("text", "").lower()
                    for record in content_records for block in record["event"]["content"]
                    if block["type"] == "text")
-        await manager.reset("integration")
+        await manager.reset("a" * 32)
         assert process.is_closed
         assert not (await process.execution.inspect())["Running"]
     finally:
@@ -569,10 +599,10 @@ async def test_retirement_during_allocation_destroys_unattached_handle(manager, 
     entered, release = asyncio.Event(), asyncio.Event()
     allocate = manager.sandbox_service.allocate
 
-    async def blocked(user, conversation):
+    async def blocked(user, conversation, **kwargs):
         entered.set()
         await release.wait()
-        return await allocate(user, conversation)
+        return await allocate(user, conversation, **kwargs)
 
     manager.sandbox_service.allocate = blocked
     factory = AsyncMock()
@@ -599,10 +629,10 @@ async def test_cancelled_request_preserves_allocation(manager):
     entered, release = asyncio.Event(), asyncio.Event()
     allocate = manager.sandbox_service.allocate
 
-    async def blocked(user, conversation):
+    async def blocked(user, conversation, **kwargs):
         entered.set()
         await release.wait()
-        return await allocate(user, conversation)
+        return await allocate(user, conversation, **kwargs)
 
     manager.sandbox_service.allocate = blocked
     task = asyncio.create_task(manager.submit("alice", "one"))
@@ -612,7 +642,7 @@ async def test_cancelled_request_preserves_allocation(manager):
         await task
     release.set()
     await asyncio.gather(*manager.background_tasks)
-    assert manager.get("alice").claude_process.prompts == ["one"]
+    assert manager.get("alice").claude_process.prompts == [contextual_prompt("one")]
     assert len(manager.sandbox_service.allocated) == 1 and not manager.sandbox_service.destroyed
 
 
@@ -669,6 +699,7 @@ async def access_manager():
     access_service = FakeAccessService()
     conversation_manager = ConversationManager(
         FakeProcess, service=FakeSandbox(), access_service=access_service,
+        daily_log_service=FakeDailyLogService(),
     )
     yield conversation_manager, access_service
     await conversation_manager.close()
@@ -983,7 +1014,7 @@ async def test_access_expiry_retires_active_conversation(access_manager, via_swe
         await conversation.cleanup_task
     assert conversation.is_retired and conversation.claude_process.is_closed
     assert access_service.revoked == [conversation.conversation_id]
-    assert conversation.claude_process.prompts == ["one"]
+    assert conversation.claude_process.prompts == [contextual_prompt("one")]
 
 
 async def test_restart_invalidation_independent_of_docker_cleanup_and_retried(access_manager):
@@ -1036,7 +1067,7 @@ async def test_cancelled_issuance_request_remains_owned_by_manager(access_manage
     await asyncio.gather(*conversation_manager.background_tasks)
     conversation = conversation_manager.get("alice")
     assert conversation.access_token_id == "grant-id"
-    assert conversation.claude_process.prompts == ["one"]
+    assert conversation.claude_process.prompts == [contextual_prompt("one")]
     assert not access_service.revoked
 
 
@@ -1230,7 +1261,7 @@ async def test_gmail_fallback_once_preserves_chat_and_expiry(access_manager, con
     if not configuration_failure:
         assert launches[0][0] and launches[0][1] == "private-bearer-token"
         assert launches[0][2].is_closed and launches[0][2].prompts == []
-    assert launches[-1][2].prompts == ["first"]
+    assert launches[-1][2].prompts == [contextual_prompt("first")]
     assert conversation.snapshot()["gmail_status"] == "unavailable"
     assert [event["gmail_status"] for event in conversation.replay_events
             if event["type"] == "gmail_status"] == ["unavailable"]
@@ -1239,7 +1270,7 @@ async def test_gmail_fallback_once_preserves_chat_and_expiry(access_manager, con
     manager.session_files_service.retire.assert_awaited()
     conversation.claude_process.finish()
     await manager.submit("alice", "second")
-    assert conversation.claude_process.prompts == ["first", "second"]
+    assert conversation.claude_process.prompts == [contextual_prompt("first"), contextual_prompt("second")]
     assert conversation.snapshot()["gmail_status"] == "unavailable"
     assert len(launches) == (1 if configuration_failure else 2)
     assert "private-bearer-token" not in repr(vars(conversation))
@@ -1326,3 +1357,231 @@ async def test_gmail_startup_deadlines_do_not_send_prompt(access_manager, monkey
     assert access.revoked
     assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
     assert not manager.get("alice").transcript_messages
+
+
+async def test_daily_logs_capture_first_and_later_local_timestamps(manager):
+    daily_log_service = manager.daily_log_service
+    manager.user_timezone_service = SimpleNamespace(resolve=AsyncMock(return_value="America/New_York"))
+    daily_log_service.timestamp = datetime(2026, 10, 13, 3, 59, tzinfo=UTC)
+    await manager.submit("alice", "first")
+    conversation = manager.get("alice")
+    first_timestamp = daily_log_service.prepare.await_args.args[2]
+    assert first_timestamp.isoformat() == "2026-10-12T23:59:00-04:00"
+    assert conversation.daily_log.local_date.isoformat() == "2026-10-12"
+    assert conversation.sandbox_handle.host_daily_logs_path == conversation.daily_log.host_daily_logs_path
+    assert conversation.claude_process.prompts == [
+        "Current user time: 2026-10-12T23:59:00-04:00\n\nfirst",
+    ]
+    daily_log_service.ensure_today.assert_not_awaited()
+    conversation.claude_process.finish()
+    daily_log_service.timestamp = datetime(2026, 10, 13, 4, 1, tzinfo=UTC)
+    await manager.submit("alice", "second")
+    second_timestamp = daily_log_service.ensure_today.await_args.args[2]
+    assert second_timestamp.isoformat() == "2026-10-13T00:01:00-04:00"
+    assert conversation.daily_log.local_date.isoformat() == "2026-10-13"
+    assert conversation.claude_process.prompts[-1] == (
+        "Current user time: 2026-10-13T00:01:00-04:00\n\nsecond"
+    )
+    assert [message["text"] for message in conversation.transcript_messages[::2]] == ["first", "second"]
+    assert [event["text"] for event in conversation.replay_events if event["type"] == "turn_start"] == ["first", "second"]
+    manager.user_timezone_service.resolve.assert_awaited_once_with("alice")
+
+
+async def test_first_timestamp_is_preserved_across_preparation_midnight(manager):
+    daily_log_service = manager.daily_log_service
+    first_timestamp = datetime(2026, 10, 12, 23, 59, tzinfo=UTC)
+    daily_log_service.timestamp = first_timestamp
+
+    async def cross_midnight(user, timezone, captured):
+        daily_log_service.timestamp = captured + timedelta(minutes=2)
+        return daily_log_service._daily_log(user, timezone, captured)
+
+    daily_log_service.prepare.side_effect = cross_midnight
+    await manager.submit("alice", "first")
+    conversation = manager.get("alice")
+    assert conversation.daily_log.local_date == first_timestamp.date()
+    assert conversation.claude_process.prompts == [
+        "Current user time: 2026-10-12T23:59:00+00:00\n\nfirst",
+    ]
+
+
+async def test_preparation_failure_prevents_sandbox_allocation(manager):
+    manager.daily_log_service.prepare.side_effect = RuntimeError("storage unavailable")
+    with pytest.raises(ChatError) as raised:
+        await manager.submit("alice", "first")
+    assert raised.value.status == 503
+    assert manager.sandbox_service.allocated == []
+    assert manager.get("alice").has_failed
+
+
+async def test_rollover_failure_continues_with_captured_context(manager, caplog):
+    await manager.submit("alice", "first")
+    conversation = manager.get("alice")
+    conversation.claude_process.finish()
+    manager.daily_log_service.ensure_today.side_effect = RuntimeError("secret file contents")
+    await manager.submit("alice", "second")
+    assert conversation.claude_process.prompts[-1] == contextual_prompt("second")
+    assert not conversation.has_failed
+    assert "secret file contents" not in caplog.text
+    assert "rollover preparation failed" in caplog.text
+
+
+@pytest.mark.parametrize("retirement", ["reset", "timeout"])
+async def test_rollover_rechecks_turn_and_blocks_concurrent_submit(manager, retirement):
+    await manager.submit("alice", "first")
+    conversation = manager.get("alice")
+    process = conversation.claude_process
+    process.finish()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def prepare(user, timezone, timestamp):
+        entered.set()
+        await release.wait()
+        return manager.daily_log_service._daily_log(user, timezone, timestamp)
+
+    manager.daily_log_service.ensure_today.side_effect = prepare
+    submitting = asyncio.create_task(manager.submit("alice", "second"))
+    await entered.wait()
+    assert conversation.active_turn_id is not None
+    with pytest.raises(ChatError, match="progress"):
+        await manager.submit("alice", "third")
+    if retirement == "reset":
+        await manager.reset("alice")
+    else:
+        manager._timeout(conversation, conversation.active_turn_id)
+    release.set()
+    await submitting
+    assert process.prompts == [contextual_prompt("first")]
+
+
+async def test_failed_destroy_allows_replacement_conversation(manager):
+    await manager.submit("alice", "first")
+    old_conversation = manager.get("alice")
+    manager.sandbox_service.destroy = AsyncMock(side_effect=RuntimeError("Docker unavailable"))
+    await manager.reset("alice")
+    await manager.submit("alice", "replacement")
+    assert manager.get("alice").conversation_id != old_conversation.conversation_id
+    assert len(manager.sandbox_service.allocated) == 2
+
+
+async def test_repeated_startup_cancellation_drains_allocation_before_cleanup(manager):
+    entered, release = asyncio.Event(), asyncio.Event()
+    allocate = manager.sandbox_service.allocate
+
+    async def blocked_allocate(user, conversation_id, **kwargs):
+        entered.set()
+        await release.wait()
+        return await allocate(user, conversation_id, **kwargs)
+
+    manager.sandbox_service.allocate = blocked_allocate
+    submitting = asyncio.create_task(manager._submit("alice", "first", None))
+    await entered.wait()
+    submitting.cancel()
+    await asyncio.sleep(0)
+    submitting.cancel()
+    await asyncio.sleep(0)
+    await manager.reset("alice")
+    assert not submitting.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await submitting
+    assert manager.sandbox_service.destroyed == manager.sandbox_service.allocated
+    await manager.submit("alice", "replacement")
+
+
+async def test_cancelled_preparation_marks_conversation_failed(manager):
+    entered = asyncio.Event()
+
+    async def blocked_prepare(*args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager.daily_log_service.prepare.side_effect = blocked_prepare
+    submitting = asyncio.create_task(manager._submit("alice", "first", None))
+    await entered.wait()
+    submitting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submitting
+    with pytest.raises(ChatError, match="new conversation"):
+        await manager.submit("alice", "retry")
+    assert manager.get("alice").has_failed
+
+
+@pytest.mark.parametrize("existing_process", [False, True])
+async def test_full_serialized_augmented_message_limit_before_send(manager, monkeypatch, existing_process):
+    if existing_process:
+        await manager.submit("alice", "first")
+        manager.get("alice").claude_process.finish()
+    # Unicode escapes are six bytes each, although the transcript uses three-byte UTF-8.
+    monkeypatch.setattr(constants, "PROTOCOL_LIMIT", 200)
+    with pytest.raises(ChatError, match="Message limit") as raised:
+        await manager.submit("alice", "雪" * 20)
+    assert raised.value.status == 413
+    conversation = manager.get("alice")
+    assert not conversation.has_failed
+    assert len(conversation.transcript_messages) == (2 if existing_process else 0)
+    assert len(manager.sandbox_service.allocated) == (1 if existing_process else 0)
+    await manager.submit("alice", "short")
+
+
+async def test_manager_closes_only_constructed_daily_log_service(monkeypatch):
+    from assistant_agent.chat import conversation_manager as manager_module
+
+    owned_service = FakeDailyLogService()
+    monkeypatch.setattr(manager_module, "DailyLogService", lambda settings: owned_service)
+    manager = ConversationManager(FakeProcess, service=FakeSandbox())
+    await manager.close()
+    owned_service.aclose.assert_awaited_once()
+    injected_service = FakeDailyLogService()
+    manager = ConversationManager(FakeProcess, service=FakeSandbox(), daily_log_service=injected_service)
+    await manager.close()
+    injected_service.aclose.assert_not_awaited()
+
+
+async def test_rollover_wait_is_inside_turn_timeout(manager, monkeypatch):
+    await manager.submit("alice", "first")
+    conversation = manager.get("alice")
+    process = conversation.claude_process
+    process.finish()
+    entered = asyncio.Event()
+
+    async def blocked_prepare(*args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager.daily_log_service.ensure_today.side_effect = blocked_prepare
+    monkeypatch.setattr(sandbox, "REQUEST_TIMEOUT_SECONDS", 0.02)
+    await manager.submit("alice", "second")
+    assert entered.is_set()
+    assert conversation.has_failed
+    assert process.prompts == [contextual_prompt("first")]
+
+
+async def test_failed_process_close_still_removes_container(manager):
+    await manager.submit("alice", "first")
+    conversation = manager.get("alice")
+    conversation.claude_process.close = AsyncMock(side_effect=RuntimeError("exec termination failed"))
+    await manager.reset("alice")
+    assert conversation.sandbox_handle in manager.sandbox_service.destroyed
+    await manager.submit("alice", "replacement")
+
+
+async def test_reset_during_timezone_resolution_releases_oversize_startup(manager, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def resolve(user):
+        entered.set()
+        await release.wait()
+        return "UTC"
+
+    manager.user_timezone_service = SimpleNamespace(resolve=resolve)
+    monkeypatch.setattr(constants, "PROTOCOL_LIMIT", 200)
+    submitting = asyncio.create_task(manager.submit("alice", "雪" * 20))
+    await entered.wait()
+    await manager.reset("alice")
+    release.set()
+    with pytest.raises(ChatError) as raised:
+        await submitting
+    assert raised.value.status == 413
+    await manager.submit("alice", "short")
+    assert len(manager.sandbox_service.allocated) == 1

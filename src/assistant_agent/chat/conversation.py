@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from assistant_agent import sandbox
+from assistant_agent.daily_logs import DailyLog
 
 from . import debug_logging
 from .claude_process import ClaudeProcess
@@ -48,6 +49,7 @@ class Conversation:
             track_background_task
         )
         self.sandbox_handle: sandbox.SandboxHandle | None = None
+        self.daily_log: DailyLog | None = None
         self.conversation_id: str = uuid.uuid4().hex
         self.transcript_messages: list[dict[str, str]] = []
         self.replay_events: deque[dict[str, Any]] = deque(maxlen=2048)
