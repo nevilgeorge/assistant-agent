@@ -15,7 +15,7 @@ services:
       retries: 12
   app:
     image: ${IMAGE_URI}
-    restart: unless-stopped
+    restart: "no"
     environment:
       APP_ENV: production
       BASE_URL: https://${DOMAIN}
@@ -29,6 +29,8 @@ services:
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-assistant-agent-production-sandboxes}
       SANDBOX_HOST_INPUT_ROOT: /srv/assistant-agent/session-inputs
       SANDBOX_APP_INPUT_ROOT: /srv/assistant-agent/session-inputs
+      SANDBOX_HOST_USER_DATA_ROOT: /srv/assistant-agent/s3/user-data
+      SANDBOX_APP_USER_DATA_ROOT: /srv/assistant-agent/s3/user-data
       CHAT_MAX_SESSIONS: ${CHAT_MAX_SESSIONS:-4}
       CHAT_IDLE_SECONDS: ${CHAT_IDLE_SECONDS:-1800}
     # docker exec is a call to the daemon socket, not a connection to the container, so
@@ -39,12 +41,18 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/assistant-agent/session-inputs:/srv/assistant-agent/session-inputs
+      - type: bind
+        source: /srv/assistant-agent/s3/user-data
+        target: /srv/assistant-agent/s3/user-data
+        bind:
+          propagation: rprivate
+          create_host_path: false
     networks:
       default:
       sandbox:
         aliases: [app]
     # The image runs as uid 10001, which is in no group that can read the socket.
-    # remote.sh resolves the host's docker gid, which differs between AMIs.
+    # apply.sh resolves the host's docker gid, which differs between AMIs.
     group_add: ["${DOCKER_GID}"]
     depends_on:
       db: {condition: service_healthy}

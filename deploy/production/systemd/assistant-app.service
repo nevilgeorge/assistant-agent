@@ -1,0 +1,22 @@
+[Unit]
+Description=Assistant application with ready daily-log storage
+Requires=docker.service assistant-daily-logs.service
+BindsTo=assistant-daily-logs.service
+After=docker.service assistant-daily-logs.service
+RequiresMountsFor=/srv/assistant-agent
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/assistant-agent
+ExecStartPre=/usr/local/libexec/assistant-agent/app-host.sh check
+ExecStart=/usr/local/libexec/assistant-agent/app-host.sh start
+ExecStartPost=/usr/bin/timeout --kill-after=2 60 /usr/local/libexec/assistant-agent/app-host.sh ready
+ExecStop=/usr/local/libexec/assistant-agent/app-host.sh stop
+ExecStopPost=/usr/local/libexec/assistant-agent/app-host.sh stop
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

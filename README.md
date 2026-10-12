@@ -7,7 +7,11 @@ attachments. Gmail access is read-only.
 The web app runs Claude Code in a dedicated sandbox for each conversation. The agent
 uses Gmail MCP tools to access your mailbox and can download selected messages and
 attachments for local analysis. Conversations last until reset, idle expiry, or an
-app restart; chat history is not persisted.
+app restart; chat history is not persisted. Each user also has persistent daily
+Markdown logs mounted at `/daily-logs`. The app creates the dated files and Claude
+reads and updates them; reset and sandbox cleanup preserve these entries. Local
+development stores them in `data/user-data`, while production uses an S3-backed
+filesystem managed on the host.
 
 ## Architecture
 
@@ -29,6 +33,8 @@ flowchart LR
     subgraph sandbox["Dedicated sandbox · one per conversation"]
         cli["Claude CLI<br/>Personal assistant agent"]
         input["/input · read-only<br/>Downloaded emails & attachments"]
+        logs["/daily-logs · read-write<br/>Persistent daily Markdown files"]
+        cli <-->|Reads & edits| logs
         cli -->|Reads| input
     end
 
@@ -73,11 +79,30 @@ You need Docker with Compose, Python 3, and [uv](https://docs.astral.sh/uv/).
 
 Open http://localhost:8000, sign in with Google, and ask the assistant a question.
 Run the script again after source changes to rebuild. For direct Compose commands,
-first run `export SANDBOX_HOST_INPUT_ROOT="$PWD/data/session-inputs"` from the repo
-root. Use `docker compose logs -f app` for logs and `docker compose down` to stop.
+export both absolute host roots from the repository root:
+
+```bash
+export SANDBOX_HOST_INPUT_ROOT="$(pwd -P)/data/session-inputs"
+export SANDBOX_HOST_USER_DATA_ROOT="$(pwd -P)/data/user-data"
+```
+
+`deploy/local.sh` initializes both roots with ownership `10001:10001` and mode
+`0700`, preserving their contents on reruns. Compose binds them separately at
+`/srv/assistant-agent/session-inputs` and `/srv/assistant-agent/user-data`. Use
+`docker compose logs -f app` for logs and `docker compose down` to stop. For direct
+host execution, set each `SANDBOX_APP_*_ROOT` to the matching absolute
+`SANDBOX_HOST_*_ROOT` and create the directories with mode `0700`, owned by the
+app runtime user. Never place either root inside the other.
 
 The local script logs completed Claude messages by default, including email content
 and tool results. Disable this with `CLAUDE_DEBUG_STREAM=false ./deploy/local.sh`.
+
+The app resolves the day using the stored Google Calendar timezone, fetching the
+primary calendar timezone when needed and falling back to UTC. Each request sends
+Claude a current timestamp with UTC offset; the app uses that same timestamp to
+create today’s file. Claude has editing permission scoped to `/daily-logs` and is
+instructed to read existing entries first and preserve them. See the
+[daily-logs plan](docs/dev-plans/daily-logs.md) for lifecycle and validation details.
 
 ## Development
 
@@ -89,6 +114,23 @@ See [AGENTS.md](AGENTS.md) for contribution guidelines and
 ## Deployment
 
 AWS infrastructure lives in [`terraform/`](terraform/), with deployment scripts in
-[`deploy/`](deploy/). After provisioning infrastructure and configuring secrets,
-run `./deploy/deploy.sh`. Use one app worker/replica per deployment and one deployment
+[`deploy/`](deploy/README.md). After provisioning infrastructure and configuring secrets,
+run `./deploy/deploy.sh --setup-s3fs` for first setup or deliberate binary repair.
+Ordinary `./deploy/deploy.sh` only checks the installed s3fs binary before stopping the app.
+Use one app worker/replica per deployment and one deployment
 per application database.
+
+Production startup is supervised by systemd after the EBS volume and daily-log
+mount are ready. Two services own storage and the app; storage preparation runs in the
+storage service. App startup recreates its direct bind against the ready mount.
+Mount service failure stops the app; recovery is an explicit operator
+action that retires its sandboxes before repairing storage. Terraform apply and
+production deployment are separate rollout steps. Follow the
+[storage operations runbook](docs/dev-plans/running-cli-inside-docker.md#production-daily-log-storage)
+for startup, recovery, reboot checks, rollback, and S3 version recovery.
+
+The instance role has S3 access limited to the application bucket’s `user-data`
+prefix. **Accepted risk:** a sandbox that can reach instance metadata could obtain
+that role and access other users’ logs. Metadata isolation remains a follow-up.
+Writer coordination is also deferred: retain one instance/worker and avoid
+overlapping a retiring conversation with a replacement writer for the same user.

@@ -1,9 +1,10 @@
 # Running agent CLIs inside Docker
 
-Last updated: 2026-10-07. Phases 1–5 are implemented. Phase 6 validation is in
-progress; the evidence checklist below remains pending until the checks pass.
-This runbook describes the current local architecture. Production deployment is
-a separate action and is outside this validation work.
+Last updated: 2026-10-12. The Gmail Phase 6 evidence below records its own
+remaining validation. Daily-log infrastructure and local wiring are described
+here; host acceptance and production rollout remain separate, explicit steps.
+See the [daily-logs development plan](daily-logs.md) for implementation and
+validation status.
 
 ## Assignment, startup, and cleanup
 
@@ -77,6 +78,8 @@ share their authorization or cleanup state safely.
 | `SANDBOX_NETWORK` | Explicit sandbox bridge; default `assistant-agent-local-sandboxes`. App joins with alias `app`. |
 | `SANDBOX_HOST_INPUT_ROOT` | Absolute directory as seen by the Docker daemon, used as sandbox bind source. Local script resolves `<repo>/data/session-inputs`; production uses `/srv/assistant-agent/session-inputs`. |
 | `SANDBOX_APP_INPUT_ROOT` | The same storage as seen by the app. Compose mounts it at `/srv/assistant-agent/session-inputs`. For direct host execution, both roots normally match. |
+| `SANDBOX_HOST_USER_DATA_ROOT` | Persistent user data as seen by the Docker daemon: local `<repo>/data/user-data`; production `/srv/assistant-agent/s3/user-data`. Keep separate from input roots. |
+| `SANDBOX_APP_USER_DATA_ROOT` | Same data as seen by the app: local Compose `/srv/assistant-agent/user-data`; production `/srv/assistant-agent/s3/user-data`. Match the host path for direct host execution. |
 | `CHAT_MAX_SESSIONS` | Default 4; counts pending allocation, live containers, and failed removal. |
 | `CHAT_IDLE_SECONDS` | Default 1800 seconds; grant expiry remains a separate fixed maximum. |
 
@@ -88,11 +91,14 @@ configuration knobs when investigating a timeout.
 For a new or upgraded local app, the existing startup order is:
 
 1. Make the selected app/sandbox images available and create the configured Docker
-   network and input storage. The input root belongs to app UID 10001 with mode
-   0700; the app needs access to the Docker socket's group.
+   network, input storage, and persistent user-data storage. Both separate roots
+   belong to app UID/GID 10001 with mode 0700; the app needs access to the Docker
+   socket's group. Initialization changes only root ownership/mode and preserves
+   files on reruns.
 2. Start PostgreSQL and wait for health.
 3. Run `alembic upgrade head` before starting the web lifespan. Existing revision
-   `0004` creates conversation access grants; Phase 6 requires no new migration.
+   `0004` creates conversation access grants; daily logs add the user-timezone
+   migration. Apply all current migrations.
 4. Start one app worker. Lifespan recovery invalidates old grants and reconciles
    assignments before agent launches become eligible. Verify `/healthz`, then
    exercise authenticated conversation startup separately: health alone does not
@@ -104,6 +110,18 @@ images, so do not use it merely to run pinned-image validation. Existing product
 scripts also apply migrations before app startup; reviewing those scripts does
 not authorize running a production deployment.
 
+For direct local Compose commands, export both paths before resolving Compose:
+
+```bash
+export SANDBOX_HOST_INPUT_ROOT="$(pwd -P)/data/session-inputs"
+export SANDBOX_HOST_USER_DATA_ROOT="$(pwd -P)/data/user-data"
+```
+
+For direct host execution, also export `SANDBOX_APP_INPUT_ROOT` equal to
+`SANDBOX_HOST_INPUT_ROOT`, and `SANDBOX_APP_USER_DATA_ROOT` equal to
+`SANDBOX_HOST_USER_DATA_ROOT`. Create both roots with mode 0700 and app runtime
+ownership; do not point either setting at the other storage tree.
+
 ## Files, permissions, and network boundaries
 
 Each generated conversation input directory is app-owned and 0755. Downloads
@@ -112,6 +130,24 @@ earlier explicit downloads remain available. The sandbox mounts only its own
 assignment at `/input:ro`. `/workspace` is agent-owned writable scratch in the
 container layer. Container removal discards copied inputs, output, processes,
 and CLI state. Downloads are explicit tool outputs, not a mailbox cache.
+
+Persistent daily logs live at `<user-data-root>/<user_id>/daily-logs/` and only
+that user’s directory is bound to `/daily-logs:rw` in a sandbox. Cleanup and reset
+delete disposable inputs and in-memory conversation history, never daily logs.
+The app creates `YYYY-MM-DD.md` files with a date/timezone header; Claude reads
+first and updates existing files, with guidance not to create, rename, or delete
+them. The stored timezone takes precedence, otherwise the app fetches the primary
+Google Calendar timezone, then falls back to UTC without saving the fallback.
+Every turn supplies `Current user time: <ISO 8601 timestamp with offset>` to Claude
+without changing the visible user prompt. That same captured time determines
+today’s app-created file, including rollover across midnight.
+
+The local user-data root is 0700; the app creates user directories that allow
+the sandbox to traverse only its mounted subtree, and daily-log directories/files
+with 0777/0666 for local UID compatibility. Production s3fs presents UID 1000,
+GID 10001, and mask 0007. Verify both sandbox UID 1000 and app UID/GID 10001 access
+on the production mount. These permissions do not coordinate multiple writers.
+Keep the single-instance deployment; same-user writer coordination is deferred.
 
 Allocation uploads the exact packaged `agent_kit/CLAUDE.md` after readiness and
 before returning, within the allocation deadline. The archive contains only
@@ -129,7 +165,10 @@ flag loaded the marker in both launch modes without tool use. Registration uses
 strict MCP configuration, `/input` as an additional directory, built-ins
 `Read,Glob,Grep,Bash`, and `dontAsk`. Exact approvals cover the five Gmail tools,
 `Read(//input/**)`, `Bash(ls *)`, and `Bash(rg *)`. Python is unapproved. The legacy
-`sandbox.ask()` helper remains tool-disabled.
+`sandbox.ask()` helper remains tool-disabled. A sandbox with daily logs also
+receives `/daily-logs` as an additional directory, `Edit,Write` built-ins, and
+`Read(//daily-logs/**)` / `Edit(//daily-logs/**)` approvals (Edit governs Write).
+These grants do not approve editing `/workspace` or `/input`.
 
 Permission rules are CLI policy, not an OS isolation boundary: broad `rg`
 arguments can invoke preprocessors. `/input:ro` enforces input immutability for
@@ -146,7 +185,10 @@ Neither Docker DNS nor unpublished ports establish MCP-only isolation. Phase 6
 records actual app-route, database, other-sandbox, host, and metadata reachability
 without changing this accepted architecture. A blocked probe is evidence about
 that tested setup and time, not a universal isolation guarantee. App-side Docker
-socket access remains root-equivalent host control.
+socket access remains root-equivalent host control. Once the production instance
+role has application S3 permissions, a sandbox that reaches instance metadata
+could access other users’ `user-data` prefixes. This is an accepted risk; metadata
+isolation remains a separate follow-up.
 
 ## Browser and transport
 
@@ -181,6 +223,184 @@ Google/model credentials, or email content.
 | Cleanup incomplete/capacity exhausted | Check owned container presence and safe cleanup category. A failed removal retains its slot and inputs until removal succeeds. Allow sweeper recovery; do not manually delete mounted inputs or unrelated containers. |
 | Grant invalidation/revocation pending | Check database health and that migrations ran before lifespan. Launches remain gated during failed startup invalidation. Restore database access and allow retry. |
 | Conversation lost after restart | Expected in-memory behavior. Start a new conversation; old grants/assignments are retired during recovery. |
+
+## Production daily-log storage
+
+Production uses pinned s3fs v1.95 with FUSE 2 and EC2 instance-role credentials.
+The deployment image packages the units/helpers; deployment extracts them without
+changing instance user data. Configuration is root-only at
+`/etc/assistant-agent/storage.conf`; Compose and secrets remain under
+`/opt/assistant-agent`. Do not print the resolved Compose configuration or `.env`.
+
+Startup, including after reboot, is ordered through systemd:
+
+1. `assistant-daily-logs.service` runs guarded cleanup and preparation before foreground
+   s3fs. It verifies the EBS UUID and ext4 filesystem, preserves the root-owned 0700
+   cache at `/srv/assistant-agent/s3fs-cache`, and protects the empty uncovered
+   `/srv/assistant-agent/s3/user-data` mountpoint with `chattr +i`. Missing/wrong EBS,
+   symlinks, unexpected mounts, or nonempty uncovered directories block startup.
+   It mounts the bucket’s `user-data` prefix, verifies its FUSE type/source, and
+   performs a write/flush/close/read/delete probe as UID/GID 10001. The probe deadline
+   is 30 seconds; storage activation allows 180 seconds including preparation.
+2. `assistant-app.service` requires Docker and ready storage, verifies database health,
+   and repeats the probe through the app image and production bind. Deployment runs
+   migrations before app startup. Compose force-recreates only the app and remains
+   attached so systemd observes its exit code and restarts app failures. Production
+   app Compose has `restart: "no"` to avoid competing supervision. An `ExecStartPost`
+   probe verifies the actual recreated app container before activation succeeds.
+
+The app directly binds `/srv/assistant-agent/s3/user-data` at the same path with
+private propagation and `create_host_path: false`. There is no shared parent mount.
+Every replacement mount requires removing its old consumers and recreating the app.
+The storage service has `Restart=no`; `Requires`/`After` and `BindsTo` stop the app
+when storage disappears. A live process alone does not guarantee successful storage
+I/O; investigate filesystem failures and run the probes. Recovery remains explicit.
+
+Deployment entrypoints and ownership are described in the
+[deployment guide](../../deploy/README.md). The self-contained
+`deploy/production/bootstrap.sh` pulls images and extracts the deployment bundle;
+`production/apply.sh` handles host preparation, storage changes, database migration,
+and application startup. Runtime helpers and service units live under
+`deploy/production/runtime/` and `deploy/production/systemd/`; their installed paths
+and the flat image bundle at `/app/deploy` remain unchanged.
+
+First setup or deliberate binary repair uses `./deploy/deploy.sh --setup-s3fs`.
+The installer builds checksum-verified v1.95 source with FUSE 2 and limited build
+parallelism, preserving Amazon Linux’s minimal curl packages. It stages and validates
+replacement binaries before downtime, and installs them only after retiring consumers
+and stopping the old mount. Ordinary deployment runs only `install-s3fs.sh check`:
+version, executable architecture, shared libraries, and FUSE 2 linkage must pass before
+the app is stopped. This check makes no package changes or network requests.
+
+Migration from the previous three-unit configuration retains the old helpers and
+configuration until old consumers and FUSE mounts are gone. The old parent self-bind
+is removed only after verifying its expected EBS UUID, ext4 type, and `/s3` filesystem
+root. Unexpected mounts abort migration. The obsolete preparation unit is disabled
+and removed; rerunning after interruption tolerates already-removed legacy resources.
+
+A repeated deployment preserves a healthy unchanged mount. Changed storage
+configuration requires stopping the app and retiring sandboxes before replacing
+the mount. An inactive unchanged mount makes deployment fail visibly; run the
+operator recovery helper instead of treating deployment as recovery. App stop removes remaining containers using both the assistant owner
+and deployment labels; unrelated containers and stored daily logs remain intact.
+Sandbox private binds do not recover after a host remount, so never repair a
+mount while retaining its old conversations.
+
+### Manual recovery and reboot checks
+
+Run the recovery helper on the production host:
+
+```bash
+sudo /usr/local/libexec/assistant-agent/recover-daily-logs.sh
+```
+
+It stops and removes the app, retires remaining sandboxes even if the app unit is
+inactive, verifies consumer retirement (including transient app containers), stops and
+unmounts storage, starts and probes the mount, then recreates and probes the app. A failed step aborts
+with the app stopped. Stale cleanup is restricted to the configured mountpoint
+and expected FUSE filesystem; cleanup failure must be investigated before retry.
+Do not bypass a failure with a broad unmount, cache deletion, or an unprotected
+plain directory. Cache files may contain data from failed writes.
+
+For an explicit maintenance stop use `sudo systemctl stop assistant-app.service`.
+After repairing storage, use the recovery helper. For a planned reboot, first
+confirm both units are enabled, stop the app cleanly, then reboot during an
+approved maintenance window. On boot, verify the mount and both identity probes
+before testing a new authenticated conversation. Confirm the service ordering in
+the boot journal, and independently read back a known daily entry from S3. Test
+failure propagation and boot ordering in a disposable systemd Linux environment
+before production rollout; this document does not claim those checks have run.
+
+### Diagnostics and persistence checks
+
+```bash
+sudo systemctl is-enabled assistant-daily-logs assistant-app
+sudo systemctl status assistant-daily-logs assistant-app
+sudo journalctl -b -u assistant-daily-logs -u assistant-app
+findmnt --mountpoint /srv/assistant-agent
+findmnt --mountpoint /srv/assistant-agent/s3/user-data -o TARGET,SOURCE,FSTYPE,OPTIONS
+sudo /usr/local/libexec/assistant-agent/daily-logs-host.sh ready
+sudo /usr/local/libexec/assistant-agent/app-host.sh check
+df -h /srv/assistant-agent
+sudo du -sh /srv/assistant-agent/s3fs-cache
+```
+
+The final mount must be the expected `fuse.s3fs` filesystem. The cache lives on
+EBS; `ensure_diskfree=1024` reserves headroom and **is not a cache quota** or a
+guarantee against disk exhaustion. Monitor available space and investigate failed
+uploads before clearing anything. Probe failures log categories without file
+contents; avoid sharing private daily entries in incident output.
+
+With operator credentials scoped for the intended bucket and user, verify S3
+independently of the mount (replace placeholders locally):
+
+```bash
+aws s3 ls s3://BUCKET/user-data/USER_ID/daily-logs/ --region REGION
+aws s3 cp s3://BUCKET/user-data/USER_ID/daily-logs/YYYY-MM-DD.md /tmp/daily-log-readback.md --region REGION
+```
+
+Inspect that private local file, then remove it when finished. Verify app
+UID/GID 10001 through the app probe and sandbox UID 1000 through a real assigned
+sandbox’s daily-log read/edit. An HTTP health check alone cannot establish
+storage permissions or persistence. In a disposable host check, stop app/storage
+and verify a write to the uncovered immutable mountpoint fails, including as
+root; never disable its immutable protection to make startup succeed.
+
+### Rollback and S3 version recovery
+
+Stop `assistant-app.service` and run `app-host.sh stop` to remove all remaining
+consumers before rolling back an app image or restoring a log. Lifecycle rollback
+requires restoring the previous matching units, helpers, and Compose configuration
+together after stopping storage; never mix assets from the two lifecycles.
+Retain the EBS cache, bucket, versioning, and mountpoint protection. Review migration
+compatibility before deploying a prior image, then run readiness and start through
+systemd. Do not restore a Compose app restart policy that could start before
+storage is ready. If mount configuration also changes, use the same ordered
+stop/retire/unmount/start/probe sequence; leave the app stopped on any failure.
+
+Bucket versioning preserves overwritten/deleted objects. The instance role has no
+version-deletion permission and no version-read/list grant; use separately
+authorized operator credentials to select and recover an earlier version:
+
+```bash
+aws s3api list-object-versions --bucket BUCKET --prefix user-data/USER_ID/daily-logs/YYYY-MM-DD.md --region REGION
+aws s3api get-object --bucket BUCKET --key user-data/USER_ID/daily-logs/YYYY-MM-DD.md --version-id VERSION_ID /tmp/recovered-daily-log.md --region REGION
+```
+
+Review the recovered file privately. With the app and sandboxes stopped and the
+mount healthy, copy it back through the mounted path, preserving the intended
+ownership/permissions, then perform independent S3 readback. Restoring through the
+mount keeps its cache consistent and creates a new S3 version. Do not permanently
+delete historical versions as part of recovery. If the mount is unhealthy, repair
+and probe it before restoring or starting the app.
+
+Operational follow-ups: consider S3 access logging, CloudTrail data events for the
+user-data prefix, and CloudWatch metrics/alarms for storage errors and disk space.
+These incur additional request, logging, retention, or metric costs; no new
+monitoring infrastructure is included here. Metadata isolation and cross-instance
+or same-user writer coordination remain deferred as recorded in the
+[daily-logs plan](daily-logs.md).
+
+### Local daily-log acceptance
+
+Run `deploy/local.sh`, sign in, and ask the assistant to record a harmless test
+entry. Verify `data/user-data/<user_id>/daily-logs/<today>.md`, inspect the app
+mounts and the assigned sandbox’s `/input:ro` and `/daily-logs:rw` mounts, then
+reset and ask the assistant to reread the entry. Stop/restart the app and confirm
+cleanup removed disposable input directories but preserved the daily file. Keep
+this acceptance separate from production S3, reboot, and failure tests.
+
+Isolated local storage acceptance passed on 2026-10-12 using existing app image
+`d6d8efbf19d7` with current source mounted read-only and sandbox image
+`3880e2a0cd82` on OrbStack. In separate temporary directories, the app UID 10001
+created a daily file through `DailyLogService`; sandbox UID 1000 read its input,
+was denied an input write, and appended/flushed/reread the daily entry. Removing
+the test container and disposable inputs, then repeating root initialization,
+preserved the entry for a replacement sandbox. No labeled test containers
+remained. OrbStack reported root ownership as 0:0 after successful chown to
+10001:10001; actual identity access and mode 0700 were checked, but this does not
+verify native Linux ownership semantics. No running app or real account was used;
+authenticated reset, actual Claude editing, and S3/host acceptance remain pending.
 
 ## Validation commands and evidence
 

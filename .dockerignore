@@ -5,3 +5,4 @@ data
 .pytest_cache
 *.pyc
 terraform
+deploy/local-db-password.txt

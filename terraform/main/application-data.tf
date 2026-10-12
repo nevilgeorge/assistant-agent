@@ -59,3 +59,26 @@ resource "aws_s3_bucket_policy" "application_data" {
 output "application_data_bucket_name" {
   value = aws_s3_bucket.application_data.id
 }
+
+# s3fs may list only this prefix and operate on current user-data objects. Version
+# deletion is deliberately absent so operators can recover overwritten daily logs.
+resource "aws_iam_role_policy" "daily_logs" {
+  name = "${var.name}-daily-logs"
+  role = aws_iam_role.instance.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.application_data.arn
+        Condition = { StringLike = { "s3:prefix" = "user-data/*" } }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"]
+        Resource = "${aws_s3_bucket.application_data.arn}/user-data/*"
+      },
+    ]
+  })
+}

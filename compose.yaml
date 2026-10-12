@@ -31,11 +31,14 @@ services:
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-assistant-agent-local-sandboxes}
       SANDBOX_HOST_INPUT_ROOT: ${SANDBOX_HOST_INPUT_ROOT:?Run deploy/local.sh to resolve the absolute session root}
       SANDBOX_APP_INPUT_ROOT: /srv/assistant-agent/session-inputs
+      SANDBOX_HOST_USER_DATA_ROOT: ${SANDBOX_HOST_USER_DATA_ROOT:?Run deploy/local.sh to resolve the absolute user-data root}
+      SANDBOX_APP_USER_DATA_ROOT: /srv/assistant-agent/user-data
       CHAT_MAX_SESSIONS: ${CHAT_MAX_SESSIONS:-4}
       CHAT_IDLE_SECONDS: ${CHAT_IDLE_SECONDS:-1800}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${SANDBOX_HOST_INPUT_ROOT}:/srv/assistant-agent/session-inputs
+      - ${SANDBOX_HOST_USER_DATA_ROOT}:/srv/assistant-agent/user-data
     networks:
       default:
       sandbox:

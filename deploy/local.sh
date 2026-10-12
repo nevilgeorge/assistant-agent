@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export SANDBOX_HOST_INPUT_ROOT="$(pwd -P)/data/session-inputs"
+export SANDBOX_HOST_USER_DATA_ROOT="$(pwd -P)/data/user-data"
 export CLAUDE_DEBUG_STREAM="${CLAUDE_DEBUG_STREAM:-true}"
 
 for executable in docker python3 curl; do
@@ -28,9 +29,13 @@ if not password or app["DATABASE_URL"] != "postgresql+psycopg://assistant_agent:
 docker compose build app
 sandbox_image=$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["app"]["environment"]["SANDBOX_IMAGE"])')
 docker build -t "$sandbox_image" -f src/assistant_agent/sandbox_kit/Dockerfile src/assistant_agent/sandbox_kit
-# The app owns generated input directories; sandbox UID 1000 reads only each mounted input dir.
+# The app owns both separate roots; initialize only their ownership/mode, preserving contents.
 docker compose run --rm --no-deps --user root --entrypoint python app -c \
-  'import os; path="/srv/assistant-agent/session-inputs"; os.makedirs(path, exist_ok=True); os.chown(path, 10001, 10001); os.chmod(path, 0o700)'
+  'import os
+for path in ("/srv/assistant-agent/session-inputs", "/srv/assistant-agent/user-data"):
+    os.makedirs(path, exist_ok=True)
+    os.chown(path, 10001, 10001)
+    os.chmod(path, 0o700)'
 # The socket belongs to the Docker host/VM, whose group can differ from this machine.
 DOCKER_GID=$(docker compose run --rm --no-deps --user root \
   --volume /var/run/docker.sock:/var/run/docker.sock --entrypoint python app \
@@ -45,5 +50,6 @@ curl --fail --silent --show-error http://localhost:8000/healthz >/dev/null
 echo "Local app ready: http://localhost:8000"
 echo "Sign in and send a message from the Ask the assistant card."
 echo "For direct Compose commands: export SANDBOX_HOST_INPUT_ROOT=\"$SANDBOX_HOST_INPUT_ROOT\""
+echo "export SANDBOX_HOST_USER_DATA_ROOT=\"$SANDBOX_HOST_USER_DATA_ROOT\""
 echo "Diagnostics: docker compose ps; docker compose logs app"
 echo "Stop: docker compose down"

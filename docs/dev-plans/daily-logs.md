@@ -1,6 +1,6 @@
 # Daily agent log files on an S3-backed FUSE mount
 
-Status: Phases 1–6 implemented; Phases 7–8 pending. Last updated: 2026-10-12
+Status: Phases 1–6 implemented; Phases 7–8 code and documentation implemented; host/production acceptance pending. Last updated: 2026-10-12
 
 ## Context
 
@@ -22,6 +22,13 @@ Decisions already taken:
 - **Day boundary:** the user's primary Google Calendar timezone, UTC fallback.
 - **Instance-metadata lockdown:** separate follow-up; recorded here as an accepted risk.
 - **Local dev:** a plain directory under `data/user-data` instead of S3.
+- **Recovery:** operator-invoked only; stop the app and its sandboxes, repair and probe storage,
+  then restart the app. No automatic remount, recovery timer, or FUSE restart loop.
+- **Startup:** systemd owns production app supervision and orders every startup, including reboot,
+  after ready storage and Docker. Compose does not restart the app.
+- **Coordination:** keep the single-instance deployment; defer per-user writer coordination.
+- **Rollout:** infrastructure/code changes are distinct from explicit Terraform apply, production
+  deployment, and host acceptance; implementation does not imply those checks passed.
 
 ## Design
 
@@ -50,9 +57,9 @@ Decisions already taken:
 ### Host mount (production)
 
 - s3fs mounts `<bucket>:/user-data` at `/srv/assistant-agent/s3/user-data`.
-- The app container binds the **parent** `/srv/assistant-agent/s3` with `rslave` propagation, so an
-  s3fs remount stays visible without restarting the app. Binding the mountpoint itself would not
-  survive a remount.
+- The app container directly binds `/srv/assistant-agent/s3/user-data` at the same path
+  with private propagation and `create_host_path: false`. Storage starts before containers
+  are created; recovery removes consumers before remounting and force-recreates the app.
 - The empty mountpoint is made immutable (`chattr +i`) before mounting. If s3fs is not mounted,
   the app, root and the Docker daemon all fail to write instead of silently writing to EBS.
 - Sandboxes bind `<host root>/<user_id>/daily-logs` to `/daily-logs` with no propagation flag.
@@ -70,14 +77,15 @@ Decisions already taken:
   the foreground process while it operates as a background service for the application.
 - **Installation:** Amazon Linux 2023 already includes systemd; the instance bootstrap already
   uses `systemctl` for Docker and SSM. Only s3fs needs installation. Pin s3fs to v1.95 (FUSE 2).
-  Check package availability; otherwise `remote.sh` builds the release tarball once, guarded
-  by a version check and a SHA-256 check computed at implementation time.
-- **Single mount owner:** systemd owns startup and restart. Do not also install an fstab entry
+  Explicit `--setup-s3fs` builds the verified release tarball once. Ordinary deployment
+  only checks version, architecture, runtime libraries, and FUSE 2 linkage before downtime.
+- **Single mount owner:** systemd owns startup and shutdown; recovery is manual. Do not also install an fstab entry
   for this mount or independently mount it from deployment.
 
-Track `deploy/assistant-daily-logs.service` as a plain-text systemd unit, not XML. Bundle it in
-the app image alongside Compose and Caddy configuration. `deploy/remote.sh` extracts it,
-substitutes the bucket and region from deployment configuration, and installs it as
+Track `deploy/production/systemd/assistant-daily-logs.service` as a plain-text systemd unit, not XML. Bundle it in
+the app image alongside Compose and Caddy configuration. `deploy/production/bootstrap.sh` extracts the packaged host assets;
+`deploy/production/apply.sh` writes validated bucket, region,
+volume identity and deployment configuration, and installs the unit as
 `/etc/systemd/system/assistant-daily-logs.service`. The launch configuration is:
 
 ```ini
@@ -92,6 +100,7 @@ Type=exec
 User=root
 ExecStart=/usr/local/bin/s3fs <bucket>:/user-data /srv/assistant-agent/s3/user-data \
     -f \
+    -o fsname=<bucket>:/user-data \
     -o iam_role=auto \
     -o endpoint=<region> \
     -o url=https://s3.<region>.amazonaws.com \
@@ -106,8 +115,8 @@ ExecStart=/usr/local/bin/s3fs <bucket>:/user-data /srv/assistant-agent/s3/user-d
     -o readwrite_timeout=30 \
     -o retries=3 \
     -o dbglevel=warn
-Restart=on-failure
-RestartSec=5
+Restart=no
+TimeoutStartSec=180
 StandardOutput=journal
 StandardError=journal
 
@@ -115,8 +124,8 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-This is the launch configuration, not the complete recovery implementation: add bounded
-mount-readiness checks and stale-mount cleanup before restart. `Type=exec` confirms that the
+This is the mount command specification; the tracked unit additionally orders preparation,
+executes bounded readiness checks, and cleans up only the expected stale FUSE mount. `Type=exec` confirms that the
 executable launched, not that the mount is ready.
 
 | Parameters | Purpose |
@@ -137,22 +146,24 @@ and [write/flush implementation](https://raw.githubusercontent.com/s3fs-fuse/s3f
 Deployment and operations:
 
 - Prepare the cache and immutable empty mountpoint after the EBS data volume is mounted.
-  Configure and verify host mount propagation so the app's `rslave` bind receives remounts.
+  Preparation runs in ordered storage-service `ExecStartPre` commands.
 - After installing the unit, run `systemctl daemon-reload` and
   `systemctl enable --now assistant-daily-logs.service`. Enable starts it on future boots;
   network and data-volume dependencies order startup. Avoid restarting a healthy mount on
   every deployment; apply configuration changes with conversation retirement when needed.
 - Before admitting conversations, verify the mount and perform a bounded application-owned
   write/read/delete probe. A successful `stat` alone does not prove write access.
-- Restart a failed process with backoff and clean up any disconnected FUSE mount before
-  remounting. Do not silently use the underlying EBS directory when the mount is unavailable.
+- A failed mount stops the dependent app through systemd `BindsTo`. Recovery is manual:
+  stop app, retire its sandbox containers using both ownership and deployment labels, stop and
+  clean up the configured stale FUSE mount, start and probe storage, then start the app. Abort
+  on any failure, leaving the app stopped. Never use the underlying EBS directory as fallback.
 - After a remount, retire affected sandbox conversations: their private bind mounts are not
   repaired by restarting s3fs. New conversations use the recovered host mount.
 - Monitor service failures, filesystem errors, cache/disk space, and a periodic storage probe.
   A living process does not guarantee healthy storage. Inspect with
   `systemctl status assistant-daily-logs.service` and
   `journalctl -u assistant-daily-logs.service -f`.
-- Before implementing the full feature, prove actual Claude edits, S3 readback, reset/reread,
+- Before production acceptance, prove actual Claude edits, S3 readback, reset/reread,
   effective permissions, scoped IAM, boot startup, and remount recovery on the production host.
   Also exercise failed uploads and process termination during writes; recovery is an
   application/host concern, not an agent instruction.
@@ -315,36 +326,47 @@ Status: Implemented
 
 ### Phase 7 — Terraform, systemd, and deployment
 
+Status: Code implemented; native AL2023/systemd and production acceptance pending.
+
 - `terraform/main/application-data.tf`: `aws_iam_role_policy` on the instance role with
   `s3:ListBucket` limited to the `user-data` prefix, and `s3:GetObject`, `s3:PutObject`,
   `s3:DeleteObject`, `s3:AbortMultipartUpload` on `<bucket>/user-data/*`. No
   `DeleteObjectVersion`, so bucket versioning keeps a recoverable history of every overwrite.
 - `deploy/deploy.sh`: read the `application_data_bucket_name` output and pass it and the
-  deployment region to `remote.sh` for rendering the service configuration.
-- `deploy/assistant-daily-logs.service` and `Dockerfile`: track and bundle the service unit
+  deployment region through `production/bootstrap.sh` to `production/apply.sh` for
+  rendering the service configuration.
+- `deploy/production/systemd/assistant-daily-logs.service` and `Dockerfile`: track and bundle the service unit
   alongside the existing deployment configuration. Use the command/options from
   "s3fs-fuse mount details": `Type=exec`, root execution, s3fs `-f`, instance-role credentials,
   HTTPS region endpoint, UID/GID/masks, cache settings, timeouts/retries, warning logging,
-  `Restart=on-failure`, and `RestartSec=5`. Order startup after networking and the data volume.
-- `deploy/remote.sh` (after the `session-inputs` block): install s3fs if the pinned version is
-  missing; create the `0700` cache directory; create and `chattr +i` the mountpoint; configure
-  host propagation; extract, render, and install the systemd unit; reload systemd and enable/start
+  `Restart=no`, and a 180-second startup deadline. Order startup after networking and verified
+  EBS preparation. The app unit uses `Requires`/`After`/`BindsTo` and `Restart=on-failure`;
+  production Compose uses `restart: "no"`.
+- `deploy/production/apply.sh`: check s3fs before downtime; explicit `--setup-s3fs` stages a verified
+  source build before stopping consumers and installs it after stopping storage. Storage
+  preparation creates the `0700` cache and immutable empty mountpoint. Install
+  the two systemd units; reload systemd and enable/start
   the service. Systemd is already present on AL2023; do not install it or add a competing fstab
   entry. Avoid restarting a healthy unchanged service on every deployment; retire affected
   conversations when applying mount configuration changes.
 - Add the host readiness and stale-mount cleanup helpers needed by the service. A successful
   process launch or `stat` is insufficient: require a bounded mount and application-owned
   write/read/delete probe, and exit before app startup if storage readiness fails.
-- `deploy/compose.prod.yaml`: both env vars set to `/srv/assistant-agent/s3/user-data`; long-syntax
-  bind of `/srv/assistant-agent/s3` with `propagation: rslave` and `create_host_path: false`.
+- `deploy/production/compose.prod.yaml`: both env vars set to `/srv/assistant-agent/s3/user-data`; long-syntax
+  bind of `/srv/assistant-agent/s3/user-data` with private propagation and `create_host_path: false`.
 - `compose.yaml`, `deploy/local.sh`, `.env.example`: plain-directory equivalents, following the
   existing `SANDBOX_HOST_INPUT_ROOT` wiring.
-- `tests/test_sandbox_kit.py`: add assertions for the new compose lines (near `:138`) and
-  bundling of the service and any helper files. Validate shell syntax and the rendered unit
-  with `systemd-analyze verify` on a systemd-capable host.
+- `tests/test_deployment.py`: stubbed script execution covers bucket/region quoting, pinned
+  installer idempotency, healthy unchanged mount preservation, changed configuration retirement,
+  failed readiness, manual recovery ordering/abort, both retirement labels, wrong-volume and
+  nonempty backing rejection, immutable reruns and cleanup failure. Static assertions cover
+  Compose mappings, packaged assets and service dependencies. Shell syntax and Linux unit
+  verification are recorded separately from live host tests below.
 - `src/assistant_agent/sandbox_kit/` is not touched.
 
 ### Phase 8 — Docs
+
+Status: Implemented; rollout and unperformed acceptance are explicitly documented.
 
 - `docs/dev-plans/running-cli-inside-docker.md`: settings table and files/permissions section.
 - `README.md`: sandbox section, the stale "instance role has no application S3 permissions" line
@@ -353,19 +375,77 @@ Status: Implemented
   `systemctl status` / `journalctl` diagnostics. Explain that agents see normal files while
   the host handles S3 persistence, and record the final lifecycle decisions in this plan.
 
-## Manual steps (run by the user; no AWS CLI in this environment)
+## Implemented lifecycle and verification evidence
 
-1. On the instance: `dnf info s3fs-fuse` (if it exists at a suitable version, use it and drop the
-   source build) and confirm installing `libcurl-devel` does not replace `curl-minimal`.
-2. `terraform -chdir=terraform/main plan`: expect one added policy. If it also wants to replace
-   `aws_instance.app` (the AMI tracks latest), apply with a `-target` on the new policy.
+The image packages two units plus the host helpers in the unchanged flat `/app/deploy`
+directory. `deploy/production/bootstrap.sh` pulls images and extracts that bundle, then
+invokes `apply.sh` to perform host deployment. `apply.sh` writes a
+root-only `/etc/assistant-agent/storage.conf`, installs helpers under
+`/usr/local/libexec/assistant-agent`, and enables storage and app startup.
+`daily-logs-host.sh prepare` verifies the EBS UUID/ext4 filesystem, preserves cache contents,
+rejects a remaining parent mount and protects only an empty uncovered mountpoint. `ready`
+checks the exact FUSE type/source and runs the UID/GID 10001 probe; mount polling takes at
+most 75 seconds and probe I/O has a 30-second deadline within the 180-second service startup
+limit. `cleanup` refuses unexpected filesystems and uses a bounded non-lazy unmount.
+
+`install-s3fs.sh` accepts only v1.95 linked against `libfuse.so.2`; it protects AL2023's
+`curl-minimal` and `libcurl-minimal` packages during dependency resolution. The pinned source tag
+archive is `https://codeload.github.com/s3fs-fuse/s3fs-fuse/tar.gz/refs/tags/v1.95`, SHA-256
+`0c97b8922f005500d36f72aee29a1345c94191f61d795e2a7b79fb7e3e6f5517` (downloaded and checked
+2026-10-12). Real AL2023 dependency resolution remains a rollout gate.
+
+`app-host.sh check` waits for PostgreSQL and probes through the production app image, bind
+and identity; `app-host.sh ready` probes the actual recreated app in `ExecStartPost`
+before activation succeeds. Migrations run before `assistant-app.service` starts. Compose remains attached
+to a force-recreated app and propagates its exit code; systemd supervises it. App shutdown
+removes the app and transient app containers and verifies retirement of sandboxes
+using both owner and deployment labels. `recover-daily-logs.sh` stops the app, retires remaining
+sandboxes, stops/cleans storage, prepares/starts/probes it, then starts the app. Any failure
+aborts the sequence. Repeated deployment probes but preserves a healthy unchanged mount;
+an inactive unchanged mount requires explicit recovery. Configuration changes retire the old
+app and mount before replacing configuration. No EC2 user-data changes or writer guard were added.
+
+The list grant uses only `StringLike s3:prefix = "user-data/*"`, including `user-data/` but
+excluding a bare `user-data` listing that could enumerate sibling names. Object grants cover
+only current objects under `user-data/*`; bucket protections and versioning are unchanged.
+References: [S3 prefix conditions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html),
+[AL2023 minimal curl](https://docs.aws.amazon.com/linux/al2023/ug/curl-minimal.html),
+[Docker restart supervision](https://docs.docker.com/engine/containers/start-containers-automatically/).
+
+Historical checks completed 2026-10-12 before the lifecycle simplification (not evidence
+for the new lifecycle; see [simplification validation](simplify-s3fs.md)):
+
+| Check | Result and limits |
+| --- | --- |
+| Regression and lint | 611 passed, 15 skipped; Ruff passed. Seven existing SQLite datetime deprecation warnings. Includes 24 deployment tests. |
+| Shell and whitespace | All deployment shell scripts pass `bash -n`; `git diff --check` passed. |
+| Terraform | `fmt -check` and `validate` passed. Existing `main.tf` alignment was formatted; no apply or live plan run. |
+| Compose | Local and production configuration rendered with synthetic secrets and paths. |
+| Unit syntax/dependencies | The previous three-unit configuration passed `systemd-analyze verify` in disposable Ubuntu/systemd 255 with executable placeholders for unavailable s3fs and Docker dependencies. No running systemd manager, boot or failure-propagation test. |
+| Isolated local storage | Current DailyLogService created a file as UID 10001; UID 1000 read/wrote/fsynced it with two sandbox binds; replacement sandbox reread it after input cleanup and root reinitialization. OrbStack translates ownership, so this does not prove native Linux on-disk UID ownership. No authenticated conversation reset or billable Claude call. |
+| Production | Not performed: Terraform apply/deployment, AL2023 build, FUSE/S3 access, native identity/protection checks, reboot and manual failure recovery. |
+
+## Explicit production rollout (not performed by implementation)
+
+1. On a disposable AL2023 systemd host, verify the pinned installer and dependencies without
+   replacing `curl-minimal`; exercise service failure propagation and boot ordering.
+   See [the simplification acceptance matrix](simplify-s3fs.md) for additional migration checks.
+2. `terraform -chdir=terraform/main plan`: review the intended prefix-scoped inline policy.
+   Stop if it also proposes instance replacement (the AMI tracks latest); prepare a reviewed
+   policy-only rollout rather than approving unrelated infrastructure changes.
 3. `terraform apply`.
-4. `deploy/deploy.sh`. The first run compiles s3fs and may outlast the SSM waiter; check the
-   invocation result before assuming failure.
+4. `deploy/deploy.sh --setup-s3fs` for first setup; ordinary deployments omit the flag and
+   never compile or install packages. Explicit setup allows an extended SSM
+   execution/polling window. If polling expires, inspect the invocation status before retrying.
+5. Complete the production checks below, including independent S3 readback, both runtime
+   identities, reboot, manual recovery and fail-closed uncovered mountpoint behavior.
+
+Operational commands and rollback guidance are in the
+[Docker runtime runbook](running-cli-inside-docker.md#production-daily-log-storage).
 
 ## Verification
 
-- **Static:** `uv run pytest -q`, `uv run ruff check .`, `bash -n deploy/*.sh`,
+- **Static:** `uv run pytest -q`, `uv run ruff check .`, `for script in deploy/*.sh deploy/production/*.sh deploy/production/runtime/*.sh; do bash -n "$script" || break; done`,
   `terraform -chdir=terraform/main validate`.
 - **Local:**
   1. `deploy/local.sh`, sign in, ask the agent to note something.
@@ -377,10 +457,11 @@ Status: Implemented
   1. `findmnt /srv/assistant-agent/s3/user-data` shows `fuse.s3fs`.
   2. Repeat the local flow, then `aws s3 ls s3://<bucket>/user-data/<user_id>/daily-logs/` shows
      `<today>.md` and `aws s3 cp ... -` prints the agent's text.
-  3. Restart `assistant-daily-logs.service` with no live conversations: the app still lists
-     the directory without an app restart. Repeat across an instance reboot.
-  4. Stop the service and unmount: `touch` in the mountpoint fails and a new chat returns 503.
-  5. Fail the mount with live conversations, recover through systemd, and verify affected
+  3. Run the manual recovery helper, verify app and sandbox retirement, then reread the entry
+     in a new conversation. Repeat startup verification across an instance reboot.
+  4. Stop the service and unmount: the app stops and `touch` in the uncovered mountpoint fails
+     even as root. Verify no fallback data is written to EBS.
+  5. Fail the mount with live conversations, run manual recovery, and verify affected
      conversations are retired and new conversations can read the persisted daily files.
 
 ## Risks and open items
@@ -393,5 +474,7 @@ Status: Implemented
   authority as Edit.
 - **Disconnect orphans logs:** disconnecting deletes the user row and reconnecting issues a new
   `user_id`, so old logs stay in S3 unreferenced. This plan leaves them in place.
-- **Unverified until implementation:** s3fs package availability on AL2023, tz data in the app
-  image, the exact S3 calls s3fs needs at mount time, and Docker's handling of a FUSE bind source.
+- **Pending host acceptance:** exact AL2023 package/dependency installation, live scoped-IAM
+  mount/probe behavior, direct FUSE binds and container recreation, immutable EBS protection, real systemd
+  boot/failure propagation, and reboot/manual recovery with S3 readback. The app has an explicit
+  tzdata dependency; isolated local daily-file preparation exercised UTC resolution.
