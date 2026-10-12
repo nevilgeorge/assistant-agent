@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, event, inspect, select
+from sqlalchemy import MetaData, Table, create_engine, event, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -33,16 +33,18 @@ def test_sandbox_access_migration_preserves_accounts_and_sessions(
 ) -> None:
     database_engine, migration_config = make_migrated_engine(tmp_path, monkeypatch)
     timestamp = datetime.now(timezone.utc)
+    historical_users = Table("users", MetaData(), autoload_with=database_engine)
     with database_engine.begin() as database_connection:
-        database_connection.execute(User.__table__.insert().values(
+        database_connection.execute(historical_users.insert().values(
             user_id="a" * 32, google_sub="google-sub", email="user@example.com",
             credentials=b"encrypted-credentials", scopes="[]",
+            connected_at=timestamp, updated_at=timestamp,
         ))
         database_connection.execute(WebSession.__table__.insert().values(
             id="b" * 32, session_token_hash="c" * 64, user_id="a" * 32,
             csrf_token="csrf", expires_at=timestamp,
         ))
-        original_users = database_connection.execute(select(User.__table__)).all()
+        original_users = database_connection.execute(select(historical_users)).all()
         original_sessions = database_connection.execute(select(WebSession.__table__)).all()
 
     command.upgrade(migration_config, "head")
@@ -92,7 +94,7 @@ def test_sandbox_access_migration_preserves_accounts_and_sessions(
     command.downgrade(migration_config, "0003")
     assert "sandbox_access_tokens" not in inspect(database_engine).get_table_names()
     with database_engine.connect() as database_connection:
-        assert database_connection.execute(select(User.__table__)).all() == original_users
+        assert database_connection.execute(select(historical_users)).all() == original_users
         assert database_connection.execute(select(WebSession.__table__)).all() == original_sessions
     command.upgrade(migration_config, "head")
     assert "sandbox_access_tokens" in inspect(database_engine).get_table_names()

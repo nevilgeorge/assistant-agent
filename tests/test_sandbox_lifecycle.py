@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 import aiodocker
 import pytest
 
-from assistant_agent.config import ConfigError, SandboxSettings
+from assistant_agent.config import DATA_DIR, ConfigError, SandboxSettings, get_sandbox_settings
 from assistant_agent.sandbox import (
     CONVERSATION_LABEL,
     DEPLOYMENT_LABEL,
@@ -318,6 +318,84 @@ async def test_generated_symlink_rejected(lifecycle, tmp_path):
 def test_settings_validation(kwargs):
     with pytest.raises(ConfigError):
         SandboxSettings(**kwargs)
+
+
+@pytest.mark.parametrize("field", [
+    "host_input_root", "app_input_root", "host_user_data_root", "app_user_data_root",
+])
+@pytest.mark.parametrize("value", ["relative", "/", "//", "//.", "/storage/../elsewhere"])
+def test_storage_roots_reject_invalid_paths(field: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=field):
+        SandboxSettings(**{field: value})
+
+
+@pytest.mark.parametrize("namespace", ["host", "app"])
+@pytest.mark.parametrize("input_root,user_data_root", [
+    ("/storage", "/storage"),
+    ("/storage", "/storage/user-data"),
+    ("/storage/session-inputs", "/storage"),
+])
+def test_storage_roots_reject_overlap(
+    namespace: str, input_root: str, user_data_root: str,
+) -> None:
+    input_field = f"{namespace}_input_root"
+    user_data_field = f"{namespace}_user_data_root"
+    with pytest.raises(ConfigError, match=f"{input_field} and {user_data_field}"):
+        SandboxSettings(**{input_field: input_root, user_data_field: user_data_root})
+
+
+def test_storage_root_defaults() -> None:
+    settings = SandboxSettings()
+    assert settings.host_input_root == settings.app_input_root == DATA_DIR / "session-inputs"
+    assert settings.host_user_data_root == settings.app_user_data_root == DATA_DIR / "user-data"
+
+
+def test_storage_root_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = {
+        "host_input_root": "/host/session-inputs",
+        "app_input_root": "/app/session-inputs",
+        "host_user_data_root": "/host/user-data",
+        "app_user_data_root": "/app/user-data",
+    }
+    for field, root in roots.items():
+        monkeypatch.setenv(f"SANDBOX_{field.upper()}", root)
+    settings = get_sandbox_settings()
+    for field, root in roots.items():
+        assert getattr(settings, field) == Path(root)
+
+
+@pytest.mark.parametrize("user_data_root", ["/storage/user-data", "/storage/inputs-extra"])
+def test_storage_roots_accept_siblings_and_normalize(user_data_root: str) -> None:
+    settings = SandboxSettings(
+        host_input_root="/storage//inputs/./",
+        host_user_data_root=user_data_root,
+        app_input_root="/app/inputs",
+        app_user_data_root="/app/user-data",
+    )
+    assert settings.host_input_root == Path("/storage/inputs")
+    assert settings.host_user_data_root == Path(user_data_root)
+    assert settings.app_input_root == Path("/app/inputs")
+    assert settings.app_user_data_root == Path("/app/user-data")
+
+
+def test_storage_roots_compare_only_within_namespace() -> None:
+    settings = SandboxSettings(
+        host_input_root="/storage/inputs",
+        host_user_data_root="/storage/user-data",
+        app_input_root="/storage/user-data",
+        app_user_data_root="/storage/inputs",
+    )
+    assert settings.host_input_root == settings.app_user_data_root
+    assert settings.host_user_data_root == settings.app_input_root
+
+
+def test_storage_roots_do_not_resolve_symlinks(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    user_data_root = tmp_path / "user-data"
+    input_root.mkdir()
+    user_data_root.symlink_to(input_root, target_is_directory=True)
+    settings = SandboxSettings(host_input_root=input_root, host_user_data_root=user_data_root)
+    assert settings.host_user_data_root == user_data_root
 
 
 async def test_ambiguous_create_response_recovers_by_deterministic_name(lifecycle):

@@ -30,6 +30,7 @@ async def web(tmp_path, monkeypatch):
 
     config.get_settings.cache_clear()
     monkeypatch.setattr(module, "Sandbox", FakeSandbox)
+    monkeypatch.setattr(module, "fetch_primary_calendar_timezone", lambda creds: None)
     # Production applies migrations before lifespan startup and grant invalidation.
     setup_engine = module.make_async_engine(config.get_settings().database_url)
     try:
@@ -894,3 +895,36 @@ async def test_restart_invalidation_preserves_browser_sessions_even_without_dock
             )
             assert grant.revoked_at is not None
         assert await restarted_app.state.web_store.session(session_token) is not None
+
+
+async def test_oauth_timezone_saved_and_reconnect_updates(web, monkeypatch):
+    monkeypatch.setattr(web.module, "fetch_primary_calendar_timezone", lambda creds: "Asia/Tokyo")
+    client = await connect(web, monkeypatch, "timezone-sub", "user@example.com")
+    original_token = client.cookies.get(web.COOKIE)
+    user = await web.web_store.user_by_google_sub("timezone-sub")
+    assert user.timezone == "Asia/Tokyo"
+    monkeypatch.setattr(web.module, "fetch_primary_calendar_timezone", lambda creds: "Europe/London")
+    reconnected = await connect(web, monkeypatch, "timezone-sub", "user@example.com")
+    updated = await web.web_store.user_by_google_sub("timezone-sub")
+    assert updated.user_id == user.user_id
+    assert updated.timezone == "Europe/London"
+    assert (await web.web_store.session(reconnected.cookies.get(web.COOKIE))).user_id == user.user_id
+    assert original_token != reconnected.cookies.get(web.COOKIE)
+
+
+@pytest.mark.parametrize("failure", ["lookup", "save", "invalid"])
+async def test_oauth_timezone_failure_preserves_value_and_authenticates(web, monkeypatch, failure):
+    user_id = await web.web_store.save_credentials("timezone-sub", "user@example.com", credentials())
+    await web.web_store.save_timezone(user_id, "Asia/Tokyo")
+    if failure == "lookup":
+        def failed_lookup(creds):
+            raise RuntimeError("raw response with secret")
+        monkeypatch.setattr(web.module, "fetch_primary_calendar_timezone", failed_lookup)
+    elif failure == "save":
+        monkeypatch.setattr(web.module, "fetch_primary_calendar_timezone", lambda creds: "Europe/London")
+        monkeypatch.setattr(web.web_store, "save_timezone", AsyncMock(side_effect=RuntimeError("db")))
+    else:
+        monkeypatch.setattr(web.module, "fetch_primary_calendar_timezone", lambda creds: None)
+    client = await connect(web, monkeypatch, "timezone-sub", "user@example.com")
+    assert (await web.web_store.user(user_id)).timezone == "Asia/Tokyo"
+    assert (await web.web_store.session(client.cookies.get(web.COOKIE))).user_id == user_id

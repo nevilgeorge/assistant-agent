@@ -53,6 +53,7 @@ class User(Base):
     )
     credentials: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     scopes: Mapped[str] = mapped_column(String(2048), nullable=False)
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sessions: Mapped[list[WebSession]] = relationship(back_populates="user")
 
 

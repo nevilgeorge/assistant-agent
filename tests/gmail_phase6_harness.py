@@ -185,6 +185,7 @@ class IntegrationHarness:
         self.monkeypatch.setattr(web, "account_identity", lambda creds, expected_nonce: (
             creds.token.removeprefix("synthetic-") + "@example.invalid", creds.token))
         self.monkeypatch.setattr(web, "revoke", lambda creds: True)
+        self.monkeypatch.setattr(web, "fetch_primary_calendar_timezone", lambda creds: None)
         from assistant_agent.chat.conversation import Conversation
         original_receive = Conversation.receive
         def capture_receive(conversation: Conversation, message: dict) -> None:

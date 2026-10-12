@@ -29,6 +29,7 @@ from assistant_agent.database import make_async_engine, make_async_session_facto
 from assistant_agent.chat import ChatError, Conversation, ConversationManager
 from assistant_agent.config import ConfigError, SCOPES, Settings, TEMPLATES_DIR, get_settings
 from assistant_agent.google_oauth import account_identity, authorization_url, exchange_code, revoke
+from assistant_agent.user_timezone import fetch_primary_calendar_timezone
 from assistant_agent.web_store import WebStore
 from assistant_agent.gmail_service import GmailService
 from assistant_agent.gmail_mcp import GmailMCP
@@ -235,6 +236,12 @@ async def callback(
         if not sub or not creds.refresh_token or not set(SCOPES).issubset(set(creds.scopes or [])):
             return _bad_request("Google did not grant the requested read-only access.")
         user_id = await web_store.save_credentials(sub, email, creds)
+        try:
+            timezone_name = await google_worker.run(fetch_primary_calendar_timezone, creds)
+            if timezone_name is not None:
+                await web_store.save_timezone(user_id, timezone_name)
+        except Exception:
+            logger.warning("OAuth timezone lookup or persistence failed")
         new_token, _ = await web_store.rotate(token, user_id)
     except Exception:
         logger.exception("OAuth callback failed")

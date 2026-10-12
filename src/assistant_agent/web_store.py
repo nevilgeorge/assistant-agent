@@ -124,6 +124,15 @@ class WebStore:
             await db.flush()
             return user.user_id
 
+    async def save_timezone(self, user_id: str, timezone_name: str) -> None:
+        """Update timezone metadata without recreating a disconnected user."""
+        async with self.factory.begin() as db:
+            await db.execute(
+                update(User)
+                .where(User.user_id == user_id)
+                .values(timezone=timezone_name, updated_at=utcnow())
+            )
+
     async def load_credentials(self, user_id: str) -> Credentials | None:
         user = await self.user(user_id)
         if user is None:

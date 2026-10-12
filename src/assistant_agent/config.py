@@ -132,6 +132,8 @@ class SandboxSettings:
     network: str = "assistant-agent-local-sandboxes"
     host_input_root: Path = DATA_DIR / "session-inputs"
     app_input_root: Path = DATA_DIR / "session-inputs"
+    host_user_data_root: Path = DATA_DIR / "user-data"
+    app_user_data_root: Path = DATA_DIR / "user-data"
 
     def __post_init__(self) -> None:
         import re
@@ -142,11 +144,20 @@ class SandboxSettings:
                 raise ConfigError(f"Sandbox {field} must be nonempty and contain no whitespace.")
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", self.deployment_id):
             raise ConfigError("SANDBOX_DEPLOYMENT_ID must be a safe Docker name component.")
-        for field in ("host_input_root", "app_input_root"):
+        for field in (
+            "host_input_root", "app_input_root", "host_user_data_root", "app_user_data_root",
+        ):
             value = Path(getattr(self, field))
-            if not value.is_absolute() or ".." in value.parts or value == Path("/"):
+            if not value.is_absolute() or ".." in value.parts or value == Path(value.anchor):
                 raise ConfigError(f"Sandbox {field} must be an absolute non-root path.")
             object.__setattr__(self, field, value)
+        for namespace in ("host", "app"):
+            input_field = f"{namespace}_input_root"
+            user_data_field = f"{namespace}_user_data_root"
+            input_root = getattr(self, input_field)
+            user_data_root = getattr(self, user_data_field)
+            if input_root.is_relative_to(user_data_root) or user_data_root.is_relative_to(input_root):
+                raise ConfigError(f"Sandbox {input_field} and {user_data_field} must not overlap.")
 
 
 def get_sandbox_settings() -> SandboxSettings:
@@ -156,4 +167,6 @@ def get_sandbox_settings() -> SandboxSettings:
         network=os.getenv("SANDBOX_NETWORK", "assistant-agent-local-sandboxes"),
         host_input_root=Path(os.getenv("SANDBOX_HOST_INPUT_ROOT", str(DATA_DIR / "session-inputs"))),
         app_input_root=Path(os.getenv("SANDBOX_APP_INPUT_ROOT", str(DATA_DIR / "session-inputs"))),
+        host_user_data_root=Path(os.getenv("SANDBOX_HOST_USER_DATA_ROOT", str(DATA_DIR / "user-data"))),
+        app_user_data_root=Path(os.getenv("SANDBOX_APP_USER_DATA_ROOT", str(DATA_DIR / "user-data"))),
     )
