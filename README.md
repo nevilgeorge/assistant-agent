@@ -11,7 +11,10 @@ app restart; chat history is not persisted. Each user also has persistent daily
 Markdown logs mounted at `/daily-logs`. The app creates the dated files and Claude
 reads and updates them; reset and sandbox cleanup preserve these entries. Local
 development stores them in `data/user-data`, while production uses an S3-backed
-filesystem managed on the host.
+filesystem mounted by s3fs on the host. Each sandbox receives a bind mount of its
+user's daily-log directory. The app retrieves the primary Google Calendar timezone
+and caches it in PostgreSQL to date these files in the user's local time, falling
+back to UTC when unavailable.
 
 ## Architecture
 
@@ -22,15 +25,16 @@ flowchart LR
     subgraph google["Google"]
         auth["Google sign-in"]
         gmail["Gmail API · read-only"]
+        calendar["Google Calendar API<br/>Primary calendar timezone"]
     end
 
     subgraph app["Assistant application"]
         web["Web app & conversation manager"]
         mcp["Gmail MCP server"]
-        db[("PostgreSQL<br/>Accounts & encrypted Google credentials")]
+        db[("PostgreSQL<br/>Accounts, cached timezones & encrypted Google credentials")]
     end
 
-    subgraph sandbox["Dedicated sandbox · one per conversation"]
+    subgraph sandbox["Dedicated Docker sandbox · one per conversation"]
         cli["Claude CLI<br/>Personal assistant agent"]
         input["/input · read-only<br/>Downloaded emails & attachments"]
         logs["/daily-logs · read-write<br/>Persistent daily Markdown files"]
@@ -38,19 +42,40 @@ flowchart LR
         cli -->|Reads| input
     end
 
+    subgraph host["Host services & persistent storage"]
+        docker["Docker daemon"]
+        local[("Development<br/>data/user-data")]
+        s3fs["Production<br/>Host-managed s3fs mount"]
+    end
+
+    s3[("Amazon S3<br/>user-data prefix")]
     model["Anthropic API<br/>Claude model"]
 
     user <-->|Chat & streamed responses| web
     user -->|Sign in| auth
     auth -->|OAuth callback| web
     web --> db
-    web <-->|Starts CLI & streams messages| cli
+    web <-->|Fetches primary timezone| calendar
+    web -->|Creates dated daily-log files| logs
+    web -->|Docker socket · creates & removes sandboxes| docker
+    docker -->|Manages container lifecycle| sandbox
+    web <-->|Docker exec · CLI input & streamed output| cli
+    local ---|Per-user bind mount · development| logs
+    s3fs ---|Per-user bind mount · production| logs
+    s3fs <-->|Reads & writes objects| s3
     cli <-->|Authenticated MCP tool calls| mcp
     mcp <-->|Search & retrieve| gmail
     mcp -->|Publishes selected downloads| input
     mcp -->|Loads Google credentials| db
     cli <-->|Model requests & responses| model
 ```
+
+The application controls sandbox lifecycle and Claude execution through the host's
+Docker daemon socket. `/input` contains conversation-specific downloads, while
+`/daily-logs` exposes persistent storage shared by the app and that user's sandbox.
+The Calendar connection supplies timezone metadata; chat tools currently access
+Gmail. In production, Caddy terminates HTTPS, and systemd starts the app only after
+the daily-log mount is ready (see [deployment details](deploy/README.md)).
 
 ## Run locally
 
