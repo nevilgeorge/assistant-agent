@@ -5,6 +5,7 @@ from fastapi import Request
 from assistant_agent.async_workers import AsyncWorker
 from assistant_agent.chat import ConversationManager
 from assistant_agent.config import Settings
+from assistant_agent.file_viewer import FileViewerService
 from assistant_agent.gmail_service import GmailService
 from assistant_agent.sandbox import Sandbox
 from assistant_agent.sandbox_access import SandboxAccessService
@@ -29,6 +30,10 @@ async def get_conversation_manager(request: Request) -> ConversationManager:
 
 async def get_sandbox_service(request: Request) -> Sandbox:
     return request.app.state.sandbox_service
+
+
+async def get_file_viewer_service(request: Request) -> FileViewerService:
+    return request.app.state.file_viewer_service
 
 
 async def get_sandbox_access_service(request: Request) -> SandboxAccessService:

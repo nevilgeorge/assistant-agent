@@ -112,6 +112,20 @@ class ConversationManager:
             return None
         return sandbox_handle
 
+    def file_sandbox(self, user_id: str, conversation_id: str) -> sandbox.SandboxHandle | None:
+        """Resolve an existing readable sandbox without starting or extending a session."""
+        conversation = self.conversations.get(user_id)
+        if (
+            self.stopped or user_id in self.blocked_users or conversation is None
+            or conversation.conversation_id != conversation_id or conversation.is_retired
+            or conversation.has_failed or conversation.is_starting or conversation.access_expired()
+        ):
+            return None
+        handle = conversation.sandbox_handle
+        if handle is None or handle.user_id != user_id or handle.conversation_id != conversation_id:
+            return None
+        return handle
+
     async def _sweep(self) -> None:
         """Periodically retire conversations that exceed the idle timeout."""
         while True:

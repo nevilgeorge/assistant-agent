@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block main_class %}connected-page{% endblock %}
 {% block content %}
+<link rel="stylesheet" href="{{ url_for('static', path='file-viewer.css').path }}">
 
 <header class="masthead">
   <div class="mark" aria-hidden="true">
@@ -55,6 +56,14 @@
   </details>
 </div>
 {% endfor %}
+<section class="card files-card" aria-labelledby="files-heading">
+  <div class="card-head">
+    <h2 id="files-heading">Files</h2>
+    <button class="btn btn-quiet" id="files-refresh" type="button" disabled>Refresh</button>
+  </div>
+  <p id="files-status" class="lede" role="status">Start a conversation to browse files.</p>
+  <ul id="files-tree" class="files-tree" aria-label="Agent files" hidden></ul>
+</section>
 </aside>
 
 <section class="card chat-card" aria-labelledby="chat-heading">
@@ -79,7 +88,15 @@
 </section>
 </div>
 
+<dialog id="file-preview" class="file-preview" aria-labelledby="file-preview-title">
+  <header class="file-preview-header">
+    <div><h2 id="file-preview-title">File preview</h2><p id="file-preview-meta" class="meta"></p></div>
+    <button id="file-preview-close" class="btn btn-quiet" type="button" autofocus>Close</button>
+  </header>
+  <div id="file-preview-body" class="file-preview-body" aria-live="polite"></div>
+</dialog>
 <script src="{{ url_for('static', path='vendor/markdown-it-14.1.0.min.js').path }}"></script>
+<script src="{{ url_for('static', path='file-viewer.js').path }}"></script>
 <script>
 const markdown = window.markdownit({html: false, breaks: true, linkify: true});
 const form = document.getElementById("message-form");
@@ -138,11 +155,13 @@ async function request(url, options) {
   return data;
 }
 async function load(notice = "") {
+  window.fileViewer.setConversation(null, false);
   if (source) source.close(); loading = true; controls();
   try {
     const snapshot = await request("/api/conversation");
     const previous = sessionStorage.getItem("chat-conversation");
     conversationId = snapshot.conversation_id;
+    window.fileViewer.setConversation(conversationId, snapshot.files_available);
     sessionStorage.setItem("chat-conversation", conversationId);
     transcript.replaceChildren(); rows.clear();
     active = Boolean(snapshot.active_turn); failed = snapshot.failed;
@@ -158,6 +177,7 @@ async function load(notice = "") {
       if (data.type === "gmail_status") {
         gmailAvailability(data.gmail_status);
       } else if (data.type === "turn_start") {
+        window.fileViewer.setConversation(conversationId, true);
         active = true; row("user", data.text, data.turn_id); row("assistant", "", data.turn_id);
         status.textContent = "Assistant is responding…";
       } else if (data.type === "assistant_delta") {
@@ -168,7 +188,7 @@ async function load(notice = "") {
           renderMessage(content, content.dataset.text + data.text); followMessages(follow);
         }
       } else if (data.type === "turn_completion") { finishPlaceholder(data.turn_id); active = false; status.textContent = "";
-      } else if (data.type === "turn_failure") { finishPlaceholder(data.turn_id, "Response interrupted."); active = false; failed = true; status.textContent = data.message; }
+      } else if (data.type === "turn_failure") { window.fileViewer.setConversation(conversationId, false); finishPlaceholder(data.turn_id, "Response interrupted."); active = false; failed = true; status.textContent = data.message; }
       controls();
     };
     source.onerror = () => { status.textContent = "Connection interrupted. Reconnecting…"; };
@@ -194,6 +214,7 @@ form.addEventListener("submit", async event => {
 });
 reset.addEventListener("click", async () => {
   reset.disabled = true;
+  window.fileViewer.setConversation(conversationId, false);
   try {
     if (source) source.close();
     await request("/api/conversation/reset", {method: "POST", headers});

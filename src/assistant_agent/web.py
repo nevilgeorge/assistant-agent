@@ -35,9 +35,11 @@ from assistant_agent.web_store import WebStore
 from assistant_agent.gmail_service import GmailService
 from assistant_agent.gmail_mcp import GmailMCP
 from assistant_agent.session_files import SessionFilesService
+from assistant_agent.file_viewer import FileViewerError, FileViewerService
 from assistant_agent.web_dependencies import (
     get_application_settings,
     get_conversation_manager,
+    get_file_viewer_service,
     get_google_worker,
     get_sandbox_access_service,
     get_web_store,
@@ -74,6 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sandbox_access_service = SandboxAccessService(session_factory)
         daily_log_service = DailyLogService(sandbox_service.settings)
         user_timezone_service = UserTimezoneService(web_store, google_worker)
+        file_viewer_service = FileViewerService(sandbox_service)
         conversation_manager = ConversationManager(
             service=sandbox_service, access_service=sandbox_access_service,
             session_files_service=session_files_service,
@@ -85,6 +88,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.gmail_service = gmail_service
         app.state.session_files_service = session_files_service
         app.state.sandbox_service = sandbox_service
+        app.state.file_viewer_service = file_viewer_service
         app.state.sandbox_access_service = sandbox_access_service
         app.state.conversation_manager = conversation_manager
         app.state.daily_log_service = daily_log_service
@@ -342,9 +346,53 @@ async def conversation(
     if isinstance(user, JSONResponse):
         return user
     try:
-        return conversation_manager.get(user).snapshot()
+        current = conversation_manager.get(user)
+        return {
+            **current.snapshot(),
+            "files_available": conversation_manager.file_sandbox(
+                user, current.conversation_id,
+            ) is not None,
+        }
     except ChatError as exc:
         return chat_error(exc)
+
+
+@router.get("/api/files")
+@router.get("/api/files/preview")
+async def files(
+    request: Request,
+    conversation_id: str,
+    root: str,
+    web_store: Annotated[WebStore, Depends(get_web_store)],
+    conversation_manager: Annotated[ConversationManager, Depends(get_conversation_manager)],
+    file_viewer_service: Annotated[FileViewerService, Depends(get_file_viewer_service)],
+    path: str = "",
+    offset: int = 0,
+):
+    """List or preview files belonging to the authenticated user's current sandbox."""
+    response_headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+    user_id = await chat_user(request, web_store)
+    if isinstance(user_id, JSONResponse):
+        user_id.headers.update(response_headers)
+        return user_id
+    handle = conversation_manager.file_sandbox(user_id, conversation_id)
+    if handle is None:
+        return JSONResponse(
+            {"error": "Start a conversation to browse files."},
+            status_code=409, headers=response_headers,
+        )
+    try:
+        if request.url.path.endswith("/preview"):
+            result = await file_viewer_service.preview_file(handle, root=root, path=path)
+        else:
+            result = await file_viewer_service.list_directory(
+                handle, root=root, path=path, offset=offset,
+            )
+        if conversation_manager.file_sandbox(user_id, conversation_id) is not handle:
+            raise FileViewerError("Conversation changed. Refresh to browse files.", 409)
+        return JSONResponse(result, headers=response_headers)
+    except FileViewerError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=exc.status, headers=response_headers)
 
 
 @router.post("/api/conversation/reset")

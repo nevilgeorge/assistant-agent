@@ -330,6 +330,7 @@ async def test_chat_routes_use_overridden_store_and_conversation_manager(web, mo
     injected_manager = SimpleNamespace(
         submit=AsyncMock(return_value={"conversation_id": conversation.conversation_id, "turn_id": "injected-turn"}),
         get=lambda user: conversation,
+        file_sandbox=lambda user, conversation_id: None,
         reset=AsyncMock(),
     )
     web.app.dependency_overrides[get_web_store] = lambda: injected_store
